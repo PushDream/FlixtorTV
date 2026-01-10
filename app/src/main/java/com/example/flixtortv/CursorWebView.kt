@@ -97,10 +97,14 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
                 handler.post {
                     Log.d("FlixtorTV", "JS onTextFieldBlurred. Was isTextFieldClicked: $isTextFieldClicked")
                     if (isTextFieldClicked) {
-                        // Add a small delay to ensure keyboard is fully hidden before restoring focus
+                        // Hide keyboard immediately, then wait for it to actually close
+                        hideKeyboard()
+                        // Shorter delay - keyboard usually closes within 150ms
                         handler.postDelayed({
-                            resetFocusAfterTextInput()
-                        }, 300)
+                            if (isTextFieldClicked) {
+                                resetFocusAfterTextInput()
+                            }
+                        }, 150)
                     }
                 }
             }
@@ -357,6 +361,7 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         eventDown.recycle()
         eventUp.recycle()
 
+        // Check synchronously what was clicked, then handle focus asynchronously
         webView.evaluateJavascript(
             """
             (function() {
@@ -364,6 +369,7 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
                 if (!el) return 'none';
                 const tag = el.tagName.toLowerCase();
                 if (tag === 'input' || tag === 'textarea') {
+                    // Focus immediately - don't wait
                     el.focus();
                     return 'text_field_clicked';
                 }
@@ -373,10 +379,13 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         ) { result ->
             Log.d("FlixtorTV", "JS Click Result: $result")
             if (result != null && result.contains("text_field_clicked")) {
-                // Text field handling is now done via JS focus events
+                // JS focus event will trigger onTextFieldFocused callback immediately
+                // Show keyboard with minimal delay to ensure focus is processed
                 handler.postDelayed({
-                    showKeyboard()
-                }, 200)
+                    if (isTextFieldClicked) {
+                        showKeyboard()
+                    }
+                }, 100)
             } else {
                 // Non-text click - ensure cursor stays visible if in pointer mode
                 if (pointerModeEnabled) {
@@ -436,35 +445,25 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     private fun resetFocusAfterTextInput() {
         Log.d("FlixtorTV", "resetFocusAfterTextInput START")
         webView.clearFocus()
-        hideKeyboard()
         isTextFieldClicked = false
 
-        // Wait a bit more to ensure keyboard is fully hidden
-        handler.postDelayed({
-            if (pointerModeEnabled) {
-                this.isFocusable = true
-                this.isFocusableInTouchMode = true
-                val focusRequested = this.requestFocus()
-                cursorView.visibility = View.VISIBLE
-                Log.d("FlixtorTV", "Focus restored to CWV: $focusRequested, hasFocus: ${this.hasFocus()}")
+        // Keyboard is already being hidden by the blur handler
+        // Restore focus immediately
+        if (pointerModeEnabled) {
+            this.isFocusable = true
+            this.isFocusableInTouchMode = true
+            this.requestFocus()
+            cursorView.visibility = View.VISIBLE
+            Log.d("FlixtorTV", "Focus restored to CWV, hasFocus: ${this.hasFocus()}")
+        } else {
+            cursorView.visibility = View.GONE
+            webView.requestFocus()
+        }
 
-                // Double-check focus after a short delay
-                handler.postDelayed({
-                    if (!this.hasFocus()) {
-                        Log.w("FlixtorTV", "CWV still doesn't have focus, trying again")
-                        this.requestFocus()
-                    }
-                }, 100)
-            } else {
-                cursorView.visibility = View.GONE
-                webView.requestFocus()
-            }
-
-            lastActivityTime = System.currentTimeMillis()
-            // Restart the focus/idle handler
-            handler.removeCallbacks(focusAndIdleHandlerRunnable)
-            handler.postDelayed(focusAndIdleHandlerRunnable, 500)
-        }, 200)
+        lastActivityTime = System.currentTimeMillis()
+        // Restart the focus/idle handler
+        handler.removeCallbacks(focusAndIdleHandlerRunnable)
+        handler.postDelayed(focusAndIdleHandlerRunnable, 500)
     }
 
     private fun resetFocus() {
