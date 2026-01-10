@@ -213,8 +213,10 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
             transitionToState(InputState.CURSOR_ACTIVE)
         }
 
-        // Enable modified focus navigation that preserves scrolling
-        enableScrollableFocusNavigation()
+        // Enable modified focus navigation that preserves scrolling (with delay to ensure WebView is ready)
+        handler.postDelayed({
+            enableScrollableFocusNavigation()
+        }, 100)
 
         focusAndIdleHandlerRunnable = object : Runnable {
             override fun run() {

@@ -201,14 +201,7 @@ fun FlixtorWebView(initialUrl: String) {
                         .edit()
                         .putString("last_url", url)
                         .apply()
-                    handler.post {
-                        if (isPointerModeEnabled()) {
-                            requestFocus()
-                            Log.d("FlixtorTV", "Restoring cursor visibility on page finish")
-                            disableFocusNavigation()
-                            updateLastActivityTime()
-                        }
-                    }
+                    restoreCursorFocus()
                     val contentHeightLog = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                         ", Content height: ${view?.contentHeight}"
                     } else {
