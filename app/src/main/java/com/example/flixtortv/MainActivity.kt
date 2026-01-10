@@ -182,13 +182,6 @@ fun FlixtorWebView(initialUrl: String) {
                     hasError = false
                     errorMessage = null
                     retryCount = 0 // Reset retry count on new page load
-                    handler.post {
-                        if (isPointerModeEnabled()) {
-                            requestFocus()
-                            Log.d("FlixtorTV", "Restoring cursor visibility on page start")
-                            updateLastActivityTime()
-                        }
-                    }
                     Log.d("FlixtorTV", "Page started: $url")
                 }
 
@@ -201,14 +194,7 @@ fun FlixtorWebView(initialUrl: String) {
                         .edit()
                         .putString("last_url", url)
                         .apply()
-                    handler.post {
-                        if (isPointerModeEnabled()) {
-                            requestFocus()
-                            Log.d("FlixtorTV", "Restoring cursor visibility on page finish")
-                            disableFocusNavigation()
-                            updateLastActivityTime()
-                        }
-                    }
+                    restoreCursorFocus()
                     val contentHeightLog = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                         ", Content height: ${view?.contentHeight}"
                     } else {
