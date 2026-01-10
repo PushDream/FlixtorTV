@@ -537,6 +537,18 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     fun isPointerModeEnabled(): Boolean = pointerModeEnabled
     fun getCursorVisibility(): Int = cursorView.visibility
 
+    // Public method for MainActivity to restore focus after page loads
+    fun restoreCursorFocus() {
+        handler.post {
+            if (isPointerModeEnabled()) {
+                requestFocus()
+                Log.d("FlixtorTV", "Restoring cursor visibility on page finish")
+                disableFocusNavigation()
+                updateLastActivityTime()
+            }
+        }
+    }
+
     fun onPause() {
         Log.d("FlixtorTV", "onPause called")
         webView.onPause()
