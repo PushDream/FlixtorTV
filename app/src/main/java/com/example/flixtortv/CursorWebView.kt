@@ -134,6 +134,11 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         } else {
             // Keyboard closed: Restore pointer mode
             pointerModeEnabled = true
+            
+            // Fix Ghost Keyboard: Explicitly blur the active element in JS/DOM
+            // This prevents subsequent clicks from popping keyboard again if input is still focused
+            webView.evaluateJavascript("if (document.activeElement) { document.activeElement.blur(); }", null)
+            
             this.requestFocus() // Steal focus back for D-pad
             cursorView.visibility = View.VISIBLE
             updateLastActivityTime()
@@ -381,21 +386,44 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
             (function() {
                 const el = document.elementFromPoint($x, $y);
                 if (!el) return 'none';
-                const tag = el.tagName.toLowerCase();
-                if (tag === 'input' || tag === 'textarea') {
-                    el.focus(); // Force focus in JS
-                    return 'text_field_clicked';
+                
+                // Recursively check for specific tags (in case we clicked a span inside a button/input)
+                let temp = el;
+                while (temp && temp !== document.body) {
+                    const tag = temp.tagName.toLowerCase();
+                    if (tag === 'input' || tag === 'textarea') {
+                        temp.focus();
+                        return 'text_field_clicked';
+                    }
+                    if (tag === 'select') {
+                        // For select, we also want to ensure it gets focus
+                        // but more importantly we tell native code NOT to steal it back
+                        return 'select_clicked';
+                    }
+                    temp = temp.parentElement;
                 }
-                return 'clicked_tag_' + tag;
+                
+                return 'clicked_tag_' + el.tagName.toLowerCase();
             })()
             """.trimIndent()
         ) { result ->
-            if (result != null && result.contains("text_field_clicked")) {
-                Log.d("FlixtorTV", "Hit text field, forcing keyboard")
-                // Assume keyboard WILL open.
-                // The global layout listener will confirm this mechanically,
-                // but we can preemptively pause the cursor logic for a split second to avoid fighting.
-                handler.postDelayed({ showKeyboard() }, 100)
+            if (result != null) {
+                 if (result.contains("text_field_clicked")) {
+                    Log.d("FlixtorTV", "Hit text field, forcing keyboard")
+                    handler.postDelayed({ showKeyboard() }, 100)
+                } else if (result.contains("select_clicked")) {
+                     Log.d("FlixtorTV", "Hit SELECT tag, pausing auto-focus for dropdown")
+                     // Do nothing! Let WebView keep focus so the popup can show.
+                     // The idle handler will eventually wake up.
+                } else {
+                     // Standard click
+                     if (pointerModeEnabled) {
+                        val cwvFocus = this@CursorWebView.requestFocus()
+                        if (cwvFocus && cursorView.visibility != View.VISIBLE) {
+                            cursorView.visibility = View.VISIBLE
+                        }
+                    }
+                }
             }
         }
         lastActivityTime = System.currentTimeMillis()
