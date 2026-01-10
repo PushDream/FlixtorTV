@@ -1,7 +1,9 @@
 package com.example.flixtortv
 
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
 import android.graphics.Bitmap
 import android.media.MediaPlayer
 import android.os.Build
@@ -18,6 +20,7 @@ import android.view.animation.ScaleAnimation
 import android.view.inputmethod.InputMethodManager
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
@@ -67,7 +70,7 @@ class MainActivity : ComponentActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val sharedPrefs = getPreferences(Context.MODE_PRIVATE)
+        val sharedPrefs = appPreferences()
         val initialUrl = sharedPrefs.getString("last_url", "https://flixtor.to/") ?: "https://flixtor.to/"
 
         setContent {
@@ -170,7 +173,8 @@ fun FlixtorWebView(initialUrl: String) {
     var showExitDialog by remember { mutableStateOf(false) }
     var retryCount by remember { mutableStateOf(0) }
     val maxRetries = 3
-    val context = LocalContext.current as MainActivity
+    val context = LocalContext.current
+    val activity = remember(context) { context.findActivity() }
     val focusRequester = remember { FocusRequester() }
 
     val cursorWebView = remember {
@@ -190,7 +194,7 @@ fun FlixtorWebView(initialUrl: String) {
                     isLoading = false
                     hasError = false
                     errorMessage = null
-                    context.getPreferences(Context.MODE_PRIVATE)
+                    context.appPreferences()
                         .edit()
                         .putString("last_url", url)
                         .apply()
@@ -203,20 +207,40 @@ fun FlixtorWebView(initialUrl: String) {
                     Log.d("FlixtorTV", "Page finished: $url$contentHeightLog")
                 }
 
+                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                    val url = request?.url?.toString()
+                    return !isAllowedUrl(url)
+                }
+
                 override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
-                    return if (url?.contains("flixtor.to") == true) {
-                        view?.loadUrl(url)
-                        false
-                    } else {
-                        true
-                    }
+                    return !isAllowedUrl(url)
                 }
 
                 override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                    if (request?.isForMainFrame == false) {
+                        Log.d("FlixtorTV", "Subresource error ignored: ${request.url}")
+                        return
+                    }
                     isLoading = false
                     hasError = true
                     errorMessage = error?.description?.toString() ?: "Unknown error"
                     Log.d("FlixtorTV", "Error: $errorMessage, URL: ${request?.url}")
+                }
+
+                override fun onReceivedHttpError(view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?) {
+                    if (request?.isForMainFrame != true) {
+                        return
+                    }
+                    isLoading = false
+                    hasError = true
+                    val statusCode = errorResponse?.statusCode
+                    val reason = errorResponse?.reasonPhrase ?: "HTTP error"
+                    errorMessage = if (statusCode != null) {
+                        "$reason ($statusCode)"
+                    } else {
+                        reason
+                    }
+                    Log.d("FlixtorTV", "HTTP error: $errorMessage, URL: ${request.url}")
                 }
             })
             loadUrl(initialUrl)
@@ -293,7 +317,7 @@ fun FlixtorWebView(initialUrl: String) {
             AlertDialog(
                 onDismissRequest = { showExitDialog = false },
                 confirmButton = {
-                    TextButton(onClick = { context.finishAffinity() }) { Text("Yes") }
+                    TextButton(onClick = { activity?.finishAffinity() }) { Text("Yes") }
                 },
                 dismissButton = {
                     TextButton(onClick = { showExitDialog = false }) { Text("No") }
@@ -304,6 +328,32 @@ fun FlixtorWebView(initialUrl: String) {
         }
     }
 }
+
+private fun isAllowedUrl(url: String?): Boolean {
+    if (url.isNullOrBlank()) {
+        return true
+    }
+    val normalized = url.lowercase()
+    return normalized.startsWith("about:") ||
+        normalized.startsWith("data:") ||
+        normalized.startsWith("blob:") ||
+        normalized.contains("flixtor.to")
+}
+
+private fun Context.findActivity(): Activity? {
+    var current: Context = this
+    while (current is ContextWrapper) {
+        if (current is Activity) {
+            return current
+        }
+        current = current.baseContext
+    }
+    return current as? Activity
+}
+
+private fun Context.appPreferences() =
+    findActivity()?.getPreferences(Context.MODE_PRIVATE)
+        ?: getSharedPreferences("flixtor_prefs", Context.MODE_PRIVATE)
 
 @Composable
 fun ErrorScreen(errorMessage: String?, onRetry: () -> Unit, modifier: Modifier = Modifier) {
