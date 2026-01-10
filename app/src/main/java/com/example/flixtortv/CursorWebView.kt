@@ -380,11 +380,12 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
             Log.d("FlixtorTV", "JS Click Result: $result")
             if (result != null && result.contains("text_field_clicked")) {
                 // JS focus event will trigger onTextFieldFocused callback immediately
+                // But we set it here too to be safe and avoid race conditions
+                isTextFieldClicked = true
+                
                 // Show keyboard with minimal delay to ensure focus is processed
                 handler.postDelayed({
-                    if (isTextFieldClicked) {
-                        showKeyboard()
-                    }
+                    showKeyboard()
                 }, 100)
             } else {
                 // Non-text click - ensure cursor stays visible if in pointer mode
@@ -433,8 +434,34 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
 
             val halfCursorWidth = cursorView.width / 2f
             val halfCursorHeight = cursorView.height / 2f
-            cursorX = (cursorX + dx).coerceIn(halfCursorWidth, (width - halfCursorWidth).coerceAtLeast(halfCursorWidth))
-            cursorY = (cursorY + dy).coerceIn(halfCursorHeight, (height - halfCursorHeight).coerceAtLeast(halfCursorHeight))
+            
+            // Calculate new position
+            val newX = cursorX + dx
+            val newY = cursorY + dy
+            
+            // Bounds
+            val minX = halfCursorWidth
+            val maxX = (width - halfCursorWidth).coerceAtLeast(halfCursorWidth)
+            val minY = halfCursorHeight
+            val maxY = (height - halfCursorHeight).coerceAtLeast(halfCursorHeight)
+            
+            // Apply bounds to cursor
+            cursorX = newX.coerceIn(minX, maxX)
+            cursorY = newY.coerceIn(minY, maxY)
+            
+            // Edge Scrolling
+            if (dx < 0 && newX <= minX) {
+                webView.scrollBy((-step).toInt(), 0)
+            } else if (dx > 0 && newX >= maxX) {
+                webView.scrollBy(step.toInt(), 0)
+            }
+            
+            if (dy < 0 && newY <= minY) {
+                webView.scrollBy(0, (-step).toInt())
+            } else if (dy > 0 && newY >= maxY) {
+                webView.scrollBy(0, step.toInt())
+            }
+
             cursorView.x = cursorX
             cursorView.y = cursorY
             lastActivityTime = System.currentTimeMillis()
