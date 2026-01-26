@@ -1,5 +1,9 @@
 # FlixtorTV
 
+![Platform](https://img.shields.io/badge/platform-Android%20TV-3DDC84)
+![Language](https://img.shields.io/badge/language-Kotlin-7F52FF)
+![License](https://img.shields.io/badge/license-MIT-blue)
+
 Android TV app (Jetpack Compose + WebView) that loads the Flixtor website in a TV-friendly shell with:
 - a splash screen animation + launch sound
 - a **D‑pad/remote cursor** ("mouse" pointer) for navigation
@@ -15,12 +19,20 @@ Android TV app (Jetpack Compose + WebView) that loads the Flixtor website in a T
 - Android WebView
 
 ## Project structure
-- `app/src/main/java/com/example/flixtortv/MainActivity.kt` — Compose UI + splash + main WebView screen
-- `app/src/main/java/com/example/flixtortv/CursorWebView.kt` — cursor/pointer overlay + D-pad navigation + keyboard/focus logic
+- `app/src/main/java/io/pushdream/flixtortv/MainActivity.kt` — Compose UI + splash + main WebView screen
+- `app/src/main/java/io/pushdream/flixtortv/CursorWebView.kt` — cursor/pointer overlay + D-pad navigation + keyboard/focus logic
 - `app/src/main/AndroidManifest.xml` — Android TV launcher intent (`LEANBACK_LAUNCHER`)
 - `app/src/main/res/drawable/tvbro_pointer.xml` — pointer drawable
 - `app/src/main/res/drawable/logo.png` — splash logo
 - `app/src/main/res/raw/launch_sound.mp3` — splash sound
+
+## Screenshots
+Add screenshots here (recommended when the repo is public).
+
+Suggested captures:
+- Home / splash screen
+- WebView + cursor overlay in action
+- Error/retry screen (if any)
 
 ## Requirements
 - Android Studio (latest stable)
@@ -51,7 +63,7 @@ Android TV app (Jetpack Compose + WebView) that loads the Flixtor website in a T
   - D-pad key handling in `onKeyDown` / `onKeyUp`
 
 ## License
-No license file is currently included. If you want this to be open source, add a `LICENSE` (MIT/Apache-2.0/etc.).
+MIT (see `LICENSE`).
 
 ## Disclaimer
 This project is provided for educational/personal use. You are responsible for complying with applicable laws, the terms of service of any websites accessed, and the policies of the Android TV platform.
