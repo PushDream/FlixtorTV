@@ -1,4 +1,4 @@
-package com.example.flixtortv
+package io.pushdream.flixtortv
 
 import android.annotation.SuppressLint
 import android.content.Context

@@ -1,12 +1,12 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.example.flixtortv">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
 
     <!-- Required for WebView access -->
     <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:allowBackup="true"
-        android:label="Flixtor"
+        android:label="FlixtorTV"
         android:icon="@mipmap/ic_launcher"
         android:theme="@style/Theme.FlixtorTV">
 

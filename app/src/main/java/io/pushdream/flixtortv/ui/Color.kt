@@ -1,4 +1,4 @@
-package com.example.flixtortv.ui.theme
+package io.pushdream.flixtortv.ui
 
 import androidx.compose.ui.graphics.Color
 

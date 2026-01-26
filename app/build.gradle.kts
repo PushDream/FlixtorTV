@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.flixtortv"
+    namespace = "io.pushdream.flixtortv"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.example.flixtortv"
+        applicationId = "io.pushdream.flixtortv"
         minSdk = 21
         targetSdk = 35
         versionCode = 1
