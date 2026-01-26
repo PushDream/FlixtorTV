@@ -26,14 +26,6 @@ Android TV app (Jetpack Compose + WebView) that loads the Flixtor website in a T
 - `app/src/main/res/drawable/logo.png` — splash logo
 - `app/src/main/res/raw/launch_sound.mp3` — splash sound
 
-## Screenshots
-Add screenshots here (recommended when the repo is public).
-
-Suggested captures:
-- Home / splash screen
-- WebView + cursor overlay in action
-- Error/retry screen (if any)
-
 ## Requirements
 - Android Studio (latest stable)
 - JDK 11 (project is configured for Java/Kotlin target 11)
