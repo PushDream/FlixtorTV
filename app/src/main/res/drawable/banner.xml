@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- TV Launcher Banner: 320x180 dp -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Background gradient -->
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:startColor="#1a1a2e"
+                android:endColor="#16213e"
+                android:angle="135" />
+        </shape>
+    </item>
+    <!-- Centered text placeholder -->
+    <item
+        android:gravity="center">
+        <bitmap
+            android:src="@drawable/logo"
+            android:gravity="center" />
+    </item>
+</layer-list>

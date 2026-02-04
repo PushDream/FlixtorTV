@@ -13,6 +13,7 @@ import android.os.Looper
 import android.util.Log
 import android.view.KeyEvent as AndroidKeyEvent
 import android.view.MotionEvent
+import android.view.View
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
 import android.view.WindowManager
@@ -58,6 +59,11 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     private val webView: WebView = WebView(ctx)
 
     var isErrorScreenVisible = false
+
+    // Fullscreen video support
+    private var customView: View? = null
+    private var customViewCallback: WebChromeClient.CustomViewCallback? = null
+    private var originalSystemUiVisibility: Int = 0
 
     // Global layout listener for keyboard detection
     private var globalLayoutListener: ViewTreeObserver.OnGlobalLayoutListener? = null
@@ -116,11 +122,83 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
                 loadWithOverviewMode = true
                 useWideViewPort = true
                 mediaPlaybackRequiresUserGesture = false
+                
+                // Caching for faster reloads
+                cacheMode = WebSettings.LOAD_DEFAULT
+                databaseEnabled = true
+                
+                // JavaScript optimizations - prevent popups
+                javaScriptCanOpenWindowsAutomatically = false
+                setSupportMultipleWindows(false)
+                
+                // Mixed content for compatibility
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                }
+                
+                // Disable safe browsing on TV (can cause issues)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    safeBrowsingEnabled = false
+                }
             }
+            
+            // Hardware acceleration for better performance
+            setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            
             isFocusable = true
             isFocusableInTouchMode = true
             descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
         }
+        
+        // Set up WebChromeClient for fullscreen video support
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onShowCustomView(view: View?, callback: CustomViewCallback?) {
+                if (customView != null) {
+                    callback?.onCustomViewHidden()
+                    return
+                }
+                
+                customView = view
+                customViewCallback = callback
+                originalSystemUiVisibility = systemUiVisibility
+                
+                // Hide cursor during fullscreen video
+                pointerModeEnabled = false
+                
+                // Add fullscreen view
+                view?.let {
+                    it.setBackgroundColor(Color.BLACK)
+                    addView(it, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+                    webView.visibility = View.GONE
+                }
+                
+                Log.d("FlixtorTV", "Entered fullscreen video mode")
+            }
+            
+            override fun onHideCustomView() {
+                if (customView == null) return
+                
+                // Remove fullscreen view
+                removeView(customView)
+                customView = null
+                webView.visibility = View.VISIBLE
+                
+                customViewCallback?.onCustomViewHidden()
+                customViewCallback = null
+                
+                // Restore cursor mode
+                pointerModeEnabled = true
+                systemUiVisibility = originalSystemUiVisibility
+                
+                Log.d("FlixtorTV", "Exited fullscreen video mode")
+            }
+            
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                super.onProgressChanged(view, newProgress)
+                // Can be used to show loading progress if needed
+            }
+        }
+        
         addView(webView)
     }
 
@@ -837,7 +915,14 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     fun loadUrl(url: String) { webView.loadUrl(url) }
     fun getUrl(): String? = webView.url
     fun setWebViewClient(client: WebViewClient) { webView.webViewClient = client }
-    fun setWebChromeClient(client: WebChromeClient) { webView.webChromeClient = client }
+    
+    // Note: setWebChromeClient is handled internally for fullscreen support
+    // Use this only if you need to extend the internal client's behavior
+    fun setWebChromeClient(client: WebChromeClient) { 
+        Log.w("FlixtorTV", "Custom WebChromeClient set - fullscreen video handling may be affected")
+        webView.webChromeClient = client 
+    }
+    
     fun updateLastActivityTime() { 
         lastActivityTime = System.currentTimeMillis()
         lastCursorUpdate = System.currentTimeMillis()
@@ -880,5 +965,38 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
             (webView.parent as ViewGroup).removeView(webView)
         }
         webView.destroy()
+    }
+    
+    /**
+     * Clear WebView cache when device is low on memory.
+     * Call this from Activity's onLowMemory() or onTrimMemory().
+     */
+    fun clearCacheOnLowMemory() {
+        webView.clearCache(true)
+        Log.d("FlixtorTV", "WebView cache cleared due to low memory")
+    }
+    
+    /**
+     * Check if currently in fullscreen video mode.
+     */
+    fun isInFullscreenMode(): Boolean = customView != null
+    
+    /**
+     * Exit fullscreen video mode if active.
+     * Returns true if was in fullscreen and exited, false otherwise.
+     */
+    fun exitFullscreen(): Boolean {
+        if (customView != null) {
+            customViewCallback?.onCustomViewHidden()
+            removeView(customView)
+            customView = null
+            webView.visibility = View.VISIBLE
+            pointerModeEnabled = true
+            systemUiVisibility = originalSystemUiVisibility
+            customViewCallback = null
+            Log.d("FlixtorTV", "Force exited fullscreen video mode")
+            return true
+        }
+        return false
     }
 }

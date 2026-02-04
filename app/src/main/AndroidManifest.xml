@@ -1,18 +1,28 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Android TV Leanback requirements -->
+    <uses-feature android:name="android.software.leanback" android:required="true" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
 
     <!-- Required for WebView access -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Required for network connectivity check -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <application
         android:allowBackup="true"
         android:label="FlixtorTV"
         android:icon="@mipmap/ic_launcher"
-        android:theme="@style/Theme.FlixtorTV">
+        android:banner="@drawable/banner"
+        android:theme="@style/Theme.FlixtorTV"
+        android:hardwareAccelerated="true"
+        android:usesCleartextTraffic="true">
 
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|keyboardHidden|keyboard|navigation">
 
             <!-- This makes it show up on Android TV home screen -->
             <intent-filter>
@@ -24,4 +34,3 @@
     </application>
 
 </manifest>
-
