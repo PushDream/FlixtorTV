@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PointF
 import android.graphics.Rect
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -18,6 +19,8 @@ import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.webkit.*
 import android.widget.FrameLayout
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 
 class CursorWebView @SuppressLint("SetJavaScriptEnabled")
 constructor(private val ctx: Context) : FrameLayout(ctx) {
@@ -26,6 +29,8 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         private const val UNCHANGED = Int.MIN_VALUE
         private const val CURSOR_DISAPPEAR_TIMEOUT = 5000L
         private const val CURSOR_HIDE_IDLE_TIMEOUT = 3000L
+        private const val KEYBOARD_SHOW_DELAY_MS = 150L
+        private const val KEYBOARD_FALLBACK_TIMEOUT_MS = 500L
     }
 
     // Cursor physics & state (TV Bro style)
@@ -46,6 +51,8 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     
     // Robust keyboard state tracking
     private var isKeyboardVisible = false
+    private var pendingTextFieldClick = false  // Track if we're waiting for keyboard after text field click
+    private var lastTextFieldClickTime = 0L
     
     private var lastCenterPressTime = 0L
     private var lastActivityTime = System.currentTimeMillis()
@@ -63,6 +70,15 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     
     // Runnable for cursor hide after inactivity
     private val cursorHideRunnable = Runnable { invalidate() }
+    
+    // Runnable for keyboard fallback retry
+    private val keyboardFallbackRunnable = Runnable {
+        if (pendingTextFieldClick && !isKeyboardVisible) {
+            Log.d("FlixtorTV", "Keyboard fallback: force-showing keyboard after timeout")
+            forceShowKeyboard()
+        }
+        pendingTextFieldClick = false
+    }
 
     // Check if cursor should be hidden due to timeout
     private val isCursorDisappeared: Boolean
@@ -129,16 +145,37 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     }
 
     private fun setupKeyboardDetection() {
+        // Try WindowInsetsCompat first (more reliable on modern devices)
+        ViewCompat.setOnApplyWindowInsetsListener(this) { _, insets ->
+            val imeVisible = insets.isVisible(WindowInsetsCompat.Type.ime())
+            val imeHeight = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
+            
+            if (imeVisible && imeHeight > 0) {
+                if (!isKeyboardVisible) {
+                    Log.d("FlixtorTV", "Keyboard OPEN detected via WindowInsets (height: $imeHeight)")
+                    onKeyboardVisibilityChanged(true)
+                }
+            } else {
+                if (isKeyboardVisible) {
+                    Log.d("FlixtorTV", "Keyboard CLOSED detected via WindowInsets")
+                    onKeyboardVisibilityChanged(false)
+                }
+            }
+            insets
+        }
+        
+        // Fallback: GlobalLayoutListener for older devices or when WindowInsets doesn't work
         globalLayoutListener = ViewTreeObserver.OnGlobalLayoutListener {
             val r = Rect()
             this.getWindowVisibleDisplayFrame(r)
             val screenHeight = this.rootView.height
             val keypadHeight = screenHeight - r.bottom
 
-            // 0.15 ratio is enough to suspect keyboard usage
-            if (keypadHeight > screenHeight * 0.15) {
+            // Use adaptive threshold: 0.12 for more sensitivity (was 0.15)
+            val threshold = screenHeight * 0.12
+            if (keypadHeight > threshold) {
                 if (!isKeyboardVisible) {
-                    Log.d("FlixtorTV", "Keyboard OPEN detected via LayoutListener")
+                    Log.d("FlixtorTV", "Keyboard OPEN detected via LayoutListener (height: $keypadHeight, threshold: $threshold)")
                     onKeyboardVisibilityChanged(true)
                 }
             } else {
@@ -157,6 +194,8 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
             // Keyboard is open: Disable pointer, let WebView handle everything
             pointerModeEnabled = false
             handler.removeCallbacks(cursorUpdateRunnable)
+            handler.removeCallbacks(keyboardFallbackRunnable)
+            pendingTextFieldClick = false
             // Ensure WebView has focus so typing works
             webView.requestFocus()
         } else {
@@ -183,19 +222,39 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
             fun onTextFieldFocused() {
                 Log.d("FlixtorTV", "JS: TextField focused")
                 handler.post {
-                    showKeyboard()
+                    pendingTextFieldClick = true
+                    lastTextFieldClickTime = System.currentTimeMillis()
+                    handler.postDelayed({ showKeyboard() }, KEYBOARD_SHOW_DELAY_MS)
+                    handler.removeCallbacks(keyboardFallbackRunnable)
+                    handler.postDelayed(keyboardFallbackRunnable, KEYBOARD_FALLBACK_TIMEOUT_MS)
                 }
             }
         }, "Android")
         
-        // Inject JS to notify us (Double tap safety)
+        // Inject JS to notify us - includes contenteditable support
         webView.evaluateJavascript(
             """
             (function() {
                 document.addEventListener('focusin', function(e) {
-                    if (['input','textarea'].includes(e.target.tagName.toLowerCase())) {
+                    const tag = e.target.tagName.toLowerCase();
+                    const isInput = ['input', 'textarea'].includes(tag);
+                    const isContentEditable = e.target.isContentEditable || e.target.contentEditable === 'true';
+                    
+                    if (isInput || isContentEditable) {
                         if (typeof Android !== 'undefined' && Android.onTextFieldFocused) {
                             Android.onTextFieldFocused();
+                        }
+                    }
+                });
+                
+                document.addEventListener('focusout', function(e) {
+                    const tag = e.target.tagName.toLowerCase();
+                    const isInput = ['input', 'textarea'].includes(tag);
+                    const isContentEditable = e.target.isContentEditable || e.target.contentEditable === 'true';
+                    
+                    if (isInput || isContentEditable) {
+                        if (typeof Android !== 'undefined' && Android.onTextFieldBlurred) {
+                            Android.onTextFieldBlurred();
                         }
                     }
                 });
@@ -526,38 +585,105 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
             """
             (function() {
                 const el = document.elementFromPoint($x, $y);
-                if (!el) return 'none';
+                if (!el) return JSON.stringify({type: 'none', tag: 'none'});
                 
-                let temp = el;
-                while (temp && temp !== document.body) {
-                    const tag = temp.tagName.toLowerCase();
-                    if (tag === 'input' || tag === 'textarea') {
-                        temp.focus();
-                        return 'text_field_clicked';
+                // Helper to check if element is text-editable
+                function isTextEditable(elem) {
+                    if (!elem) return false;
+                    const tag = elem.tagName.toLowerCase();
+                    
+                    // Check for input types that accept text
+                    if (tag === 'input') {
+                        const inputType = (elem.type || 'text').toLowerCase();
+                        const textTypes = ['text', 'password', 'email', 'tel', 'url', 'search', 'number'];
+                        return textTypes.includes(inputType);
                     }
-                    if (tag === 'select') {
-                        return 'select_clicked';
-                    }
-                    temp = temp.parentElement;
+                    
+                    // Textarea is always text-editable
+                    if (tag === 'textarea') return true;
+                    
+                    // Check for contenteditable
+                    if (elem.isContentEditable || elem.contentEditable === 'true') return true;
+                    
+                    return false;
                 }
                 
-                return 'clicked_tag_' + el.tagName.toLowerCase();
+                // Walk up DOM tree aggressively to find focusable input
+                let temp = el;
+                let depth = 0;
+                const maxDepth = 15;  // Go deeper than before
+                
+                while (temp && temp !== document.body && temp !== document.documentElement && depth < maxDepth) {
+                    if (isTextEditable(temp)) {
+                        // Found a text field - focus it and also click for good measure
+                        try {
+                            temp.focus();
+                            temp.click();
+                        } catch(e) {}
+                        return JSON.stringify({type: 'text_field', tag: temp.tagName.toLowerCase()});
+                    }
+                    
+                    const tag = temp.tagName.toLowerCase();
+                    if (tag === 'select') {
+                        return JSON.stringify({type: 'select', tag: 'select'});
+                    }
+                    
+                    temp = temp.parentElement;
+                    depth++;
+                }
+                
+                // Not a text field - blur any currently focused input to prevent ghost keyboard
+                try {
+                    const active = document.activeElement;
+                    if (active && (active.tagName.toLowerCase() === 'input' || 
+                                   active.tagName.toLowerCase() === 'textarea' ||
+                                   active.isContentEditable)) {
+                        active.blur();
+                    }
+                } catch(e) {}
+                
+                return JSON.stringify({type: 'other', tag: el.tagName.toLowerCase()});
             })()
             """.trimIndent()
         ) { result ->
             if (result != null) {
-                if (result.contains("text_field_clicked")) {
-                    Log.d("FlixtorTV", "Hit text field, forcing keyboard")
-                    handler.postDelayed({ showKeyboard() }, 100)
-                } else if (result.contains("select_clicked")) {
-                    Log.d("FlixtorTV", "Hit SELECT tag, pausing auto-focus for dropdown")
-                } else {
-                    if (pointerModeEnabled) {
-                        val cwvFocus = this@CursorWebView.requestFocus()
-                        if (cwvFocus) {
-                            invalidate()
+                try {
+                    // Parse JSON result (remove surrounding quotes from JS string)
+                    val cleanResult = result.trim().removeSurrounding("\"").replace("\\\"", "\"")
+                    Log.d("FlixtorTV", "Click target result: $cleanResult")
+                    
+                    when {
+                        cleanResult.contains("\"type\":\"text_field\"") -> {
+                            Log.d("FlixtorTV", "Hit text field, scheduling keyboard show")
+                            pendingTextFieldClick = true
+                            lastTextFieldClickTime = System.currentTimeMillis()
+                            
+                            // Delay keyboard show to let DOM settle
+                            handler.postDelayed({
+                                if (pendingTextFieldClick) {
+                                    showKeyboard()
+                                }
+                            }, KEYBOARD_SHOW_DELAY_MS)
+                            
+                            // Schedule fallback in case keyboard doesn't appear
+                            handler.removeCallbacks(keyboardFallbackRunnable)
+                            handler.postDelayed(keyboardFallbackRunnable, KEYBOARD_FALLBACK_TIMEOUT_MS)
+                        }
+                        cleanResult.contains("\"type\":\"select\"") -> {
+                            Log.d("FlixtorTV", "Hit SELECT tag, pausing auto-focus for dropdown")
+                        }
+                        else -> {
+                            // Non-text click - reclaim focus
+                            if (pointerModeEnabled) {
+                                val cwvFocus = this@CursorWebView.requestFocus()
+                                if (cwvFocus) {
+                                    invalidate()
+                                }
+                            }
                         }
                     }
+                } catch (e: Exception) {
+                    Log.e("FlixtorTV", "Error parsing click target: ${e.message}")
                 }
             }
         }
@@ -675,8 +801,27 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     }
 
     private fun showKeyboard() {
+        webView.requestFocus()
         val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        imm.showSoftInput(webView, InputMethodManager.SHOW_IMPLICIT)
+        // Try SHOW_IMPLICIT first (less intrusive)
+        val shown = imm.showSoftInput(webView, InputMethodManager.SHOW_IMPLICIT)
+        Log.d("FlixtorTV", "showKeyboard (SHOW_IMPLICIT) result: $shown")
+    }
+    
+    private fun forceShowKeyboard() {
+        webView.requestFocus()
+        val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        // Use SHOW_FORCED as last resort
+        imm.showSoftInput(webView, InputMethodManager.SHOW_FORCED)
+        Log.d("FlixtorTV", "forceShowKeyboard (SHOW_FORCED) called")
+        
+        // Also try toggling the keyboard as another fallback
+        handler.postDelayed({
+            if (!isKeyboardVisible && pendingTextFieldClick) {
+                imm.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0)
+                Log.d("FlixtorTV", "forceShowKeyboard: toggled keyboard")
+            }
+        }, 100)
     }
 
     private fun enableScrollableFocusNavigation() {
@@ -751,6 +896,7 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         if (globalLayoutListener != null) {
             this.viewTreeObserver.removeOnGlobalLayoutListener(globalLayoutListener)
         }
+        ViewCompat.setOnApplyWindowInsetsListener(this, null)
         handler.removeCallbacksAndMessages(null)
         if (webView.parent is ViewGroup) {
             (webView.parent as ViewGroup).removeView(webView)
