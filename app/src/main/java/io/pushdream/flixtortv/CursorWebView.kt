@@ -29,8 +29,9 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         private const val UNCHANGED = Int.MIN_VALUE
         private const val CURSOR_DISAPPEAR_TIMEOUT = 5000L
         private const val CURSOR_HIDE_IDLE_TIMEOUT = 3000L
-        private const val KEYBOARD_SHOW_DELAY_MS = 150L
-        private const val KEYBOARD_FALLBACK_TIMEOUT_MS = 500L
+        private const val KEYBOARD_SHOW_DELAY_MS = 200L  // Increased for DOM settle time
+        private const val KEYBOARD_FALLBACK_TIMEOUT_MS = 600L  // Slightly more time for fallback
+        private const val KEYBOARD_RETRY_DELAY_MS = 150L  // Delay between retry attempts
     }
 
     // Cursor physics & state (TV Bro style)
@@ -53,6 +54,8 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     private var isKeyboardVisible = false
     private var pendingTextFieldClick = false  // Track if we're waiting for keyboard after text field click
     private var lastTextFieldClickTime = 0L
+    private var keyboardRetryCount = 0  // Track retry attempts
+    private val maxKeyboardRetries = 2
     
     private var lastCenterPressTime = 0L
     private var lastActivityTime = System.currentTimeMillis()
@@ -74,10 +77,30 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     // Runnable for keyboard fallback retry
     private val keyboardFallbackRunnable = Runnable {
         if (pendingTextFieldClick && !isKeyboardVisible) {
-            Log.d("FlixtorTV", "Keyboard fallback: force-showing keyboard after timeout")
-            forceShowKeyboard()
+            if (keyboardRetryCount < maxKeyboardRetries) {
+                keyboardRetryCount++
+                Log.d("FlixtorTV", "Keyboard fallback retry #$keyboardRetryCount")
+                forceShowKeyboard()
+                // Schedule another check
+                handler.postDelayed({
+                    if (pendingTextFieldClick && !isKeyboardVisible && keyboardRetryCount < maxKeyboardRetries) {
+                        keyboardRetryCount++
+                        Log.d("FlixtorTV", "Keyboard fallback retry #$keyboardRetryCount (final)")
+                        forceShowKeyboard()
+                    }
+                    if (keyboardRetryCount >= maxKeyboardRetries) {
+                        pendingTextFieldClick = false
+                        keyboardRetryCount = 0
+                    }
+                }, KEYBOARD_RETRY_DELAY_MS)
+            } else {
+                pendingTextFieldClick = false
+                keyboardRetryCount = 0
+            }
+        } else {
+            pendingTextFieldClick = false
+            keyboardRetryCount = 0
         }
-        pendingTextFieldClick = false
     }
 
     // Check if cursor should be hidden due to timeout
@@ -171,8 +194,8 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
             val screenHeight = this.rootView.height
             val keypadHeight = screenHeight - r.bottom
 
-            // Use adaptive threshold: 0.12 for more sensitivity (was 0.15)
-            val threshold = screenHeight * 0.12
+            // Use adaptive threshold: 0.10 for more sensitivity on TV devices (was 0.12/0.15)
+            val threshold = screenHeight * 0.10
             if (keypadHeight > threshold) {
                 if (!isKeyboardVisible) {
                     Log.d("FlixtorTV", "Keyboard OPEN detected via LayoutListener (height: $keypadHeight, threshold: $threshold)")
@@ -196,14 +219,36 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
             handler.removeCallbacks(cursorUpdateRunnable)
             handler.removeCallbacks(keyboardFallbackRunnable)
             pendingTextFieldClick = false
+            keyboardRetryCount = 0
             // Ensure WebView has focus so typing works
             webView.requestFocus()
         } else {
             // Keyboard closed: Restore pointer mode
             pointerModeEnabled = true
             
+            // Clear any pending keyboard show attempts
+            handler.removeCallbacks(keyboardFallbackRunnable)
+            pendingTextFieldClick = false
+            keyboardRetryCount = 0
+            
+            // Explicitly hide keyboard to ensure it's truly closed
+            val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.hideSoftInputFromWindow(webView.windowToken, 0)
+            
             // Fix Ghost Keyboard: Explicitly blur the active element in JS/DOM
-            webView.evaluateJavascript("if (document.activeElement) { document.activeElement.blur(); }", null)
+            webView.evaluateJavascript("""
+                (function() {
+                    try {
+                        if (document.activeElement) {
+                            var active = document.activeElement;
+                            var tag = active.tagName.toLowerCase();
+                            if (tag === 'input' || tag === 'textarea' || active.isContentEditable) {
+                                active.blur();
+                            }
+                        }
+                    } catch(e) {}
+                })()
+            """.trimIndent(), null)
             
             this.requestFocus() // Steal focus back for D-pad
             updateLastActivityTime()
@@ -581,37 +626,40 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     }
 
     private fun checkClickTarget(x: Int, y: Int) {
+        // Reset retry counter for new click
+        keyboardRetryCount = 0
+        
         webView.evaluateJavascript(
             """
             (function() {
-                const el = document.elementFromPoint($x, $y);
-                if (!el) return JSON.stringify({type: 'none', tag: 'none'});
+                var el = document.elementFromPoint($x, $y);
                 
                 // Helper to check if element is text-editable
                 function isTextEditable(elem) {
                     if (!elem) return false;
-                    const tag = elem.tagName.toLowerCase();
+                    var tag = elem.tagName.toLowerCase();
                     
                     // Check for input types that accept text
                     if (tag === 'input') {
-                        const inputType = (elem.type || 'text').toLowerCase();
-                        const textTypes = ['text', 'password', 'email', 'tel', 'url', 'search', 'number'];
+                        var inputType = (elem.type || 'text').toLowerCase();
+                        var textTypes = ['text', 'password', 'email', 'tel', 'url', 'search', 'number'];
                         return textTypes.includes(inputType);
                     }
                     
                     // Textarea is always text-editable
                     if (tag === 'textarea') return true;
                     
-                    // Check for contenteditable
-                    if (elem.isContentEditable || elem.contentEditable === 'true') return true;
+                    // Check for contenteditable (both property and attribute)
+                    if (elem.isContentEditable) return true;
+                    if (elem.getAttribute && elem.getAttribute('contenteditable') === 'true') return true;
                     
                     return false;
                 }
                 
                 // Walk up DOM tree aggressively to find focusable input
-                let temp = el;
-                let depth = 0;
-                const maxDepth = 15;  // Go deeper than before
+                var temp = el;
+                var depth = 0;
+                var maxDepth = 20;  // Increased depth for deeply nested elements
                 
                 while (temp && temp !== document.body && temp !== document.documentElement && depth < maxDepth) {
                     if (isTextEditable(temp)) {
@@ -619,11 +667,13 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
                         try {
                             temp.focus();
                             temp.click();
+                            // Also select all text if it's an input (helps with visibility)
+                            if (temp.select) temp.select();
                         } catch(e) {}
                         return JSON.stringify({type: 'text_field', tag: temp.tagName.toLowerCase()});
                     }
                     
-                    const tag = temp.tagName.toLowerCase();
+                    var tag = temp.tagName.toLowerCase();
                     if (tag === 'select') {
                         return JSON.stringify({type: 'select', tag: 'select'});
                     }
@@ -632,17 +682,30 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
                     depth++;
                 }
                 
+                // Fallback: Check if document.activeElement is a text field after the click event propagates
+                // Use setTimeout to check after event propagation
+                setTimeout(function() {
+                    var active = document.activeElement;
+                    if (active && isTextEditable(active)) {
+                        // Post-click, an input is now focused
+                        if (typeof Android !== 'undefined' && Android.onTextFieldFocused) {
+                            Android.onTextFieldFocused();
+                        }
+                    }
+                }, 50);
+                
                 // Not a text field - blur any currently focused input to prevent ghost keyboard
                 try {
-                    const active = document.activeElement;
-                    if (active && (active.tagName.toLowerCase() === 'input' || 
-                                   active.tagName.toLowerCase() === 'textarea' ||
-                                   active.isContentEditable)) {
-                        active.blur();
+                    var active = document.activeElement;
+                    if (active) {
+                        var activeTag = active.tagName.toLowerCase();
+                        if (activeTag === 'input' || activeTag === 'textarea' || active.isContentEditable) {
+                            active.blur();
+                        }
                     }
                 } catch(e) {}
                 
-                return JSON.stringify({type: 'other', tag: el.tagName.toLowerCase()});
+                return JSON.stringify({type: 'other', tag: el ? el.tagName.toLowerCase() : 'none'});
             })()
             """.trimIndent()
         ) { result ->
@@ -803,25 +866,31 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     private fun showKeyboard() {
         webView.requestFocus()
         val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        // Try SHOW_IMPLICIT first (less intrusive)
-        val shown = imm.showSoftInput(webView, InputMethodManager.SHOW_IMPLICIT)
-        Log.d("FlixtorTV", "showKeyboard (SHOW_IMPLICIT) result: $shown")
+        // Use SHOW_FORCED for more reliable show on first attempt
+        val shown = imm.showSoftInput(webView, InputMethodManager.SHOW_FORCED)
+        Log.d("FlixtorTV", "showKeyboard (SHOW_FORCED) result: $shown")
     }
     
     private fun forceShowKeyboard() {
         webView.requestFocus()
         val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        // Use SHOW_FORCED as last resort
-        imm.showSoftInput(webView, InputMethodManager.SHOW_FORCED)
-        Log.d("FlixtorTV", "forceShowKeyboard (SHOW_FORCED) called")
         
-        // Also try toggling the keyboard as another fallback
+        // First, try restartInput to ensure IME is connected
+        imm.restartInput(webView)
+        
+        // Then force show
+        handler.postDelayed({
+            imm.showSoftInput(webView, InputMethodManager.SHOW_FORCED)
+            Log.d("FlixtorTV", "forceShowKeyboard: SHOW_FORCED after restartInput")
+        }, 50)
+        
+        // Also try toggleSoftInput as another approach
         handler.postDelayed({
             if (!isKeyboardVisible && pendingTextFieldClick) {
                 imm.toggleSoftInput(InputMethodManager.SHOW_FORCED, 0)
                 Log.d("FlixtorTV", "forceShowKeyboard: toggled keyboard")
             }
-        }, 100)
+        }, KEYBOARD_RETRY_DELAY_MS)
     }
 
     private fun enableScrollableFocusNavigation() {
@@ -851,6 +920,10 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         if (isKeyboardVisible) {
              val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
              imm.hideSoftInputFromWindow(this.windowToken, 0)
+             // Clear pending keyboard attempts
+             handler.removeCallbacks(keyboardFallbackRunnable)
+             pendingTextFieldClick = false
+             keyboardRetryCount = 0
         } else if (webView.canGoBack()) {
             webView.goBack()
         }
