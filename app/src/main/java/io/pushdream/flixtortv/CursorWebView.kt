@@ -2,60 +2,102 @@ package io.pushdream.flixtortv
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.PointF
 import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.KeyEvent as AndroidKeyEvent
 import android.view.MotionEvent
-import android.view.View
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
-import android.view.animation.Animation
-import android.view.animation.ScaleAnimation
+import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.webkit.*
 import android.widget.FrameLayout
-import androidx.core.content.ContextCompat
 
 class CursorWebView @SuppressLint("SetJavaScriptEnabled")
 constructor(private val ctx: Context) : FrameLayout(ctx) {
 
-    // Cursor & state
-    private var cursorX = 0f
-    private var cursorY = 0f
-    private val baseCursorStep = 20f
+    companion object {
+        private const val UNCHANGED = Int.MIN_VALUE
+        private const val CURSOR_DISAPPEAR_TIMEOUT = 5000L
+        private const val CURSOR_HIDE_IDLE_TIMEOUT = 3000L
+    }
+
+    // Cursor physics & state (TV Bro style)
+    private var cursorRadius: Int = 0
+    private var cursorRadiusPressed: Int = 0
+    private var maxCursorSpeed: Float = 0f
+    private var scrollStartPadding: Int = 100
+    private var cursorStrokeWidth: Float = 0f
+    
+    private val cursorDirection = android.graphics.Point(0, 0)
+    private val cursorPosition = PointF(0f, 0f)
+    private val cursorSpeed = PointF(0f, 0f)
+    private val paint = Paint()
+    
+    private var lastCursorUpdate = System.currentTimeMillis() - CURSOR_DISAPPEAR_TIMEOUT
+    private var dpadCenterPressed = false
     private var pointerModeEnabled = true
     
     // Robust keyboard state tracking
     private var isKeyboardVisible = false
     
-    private var lastKeyTime = 0L
     private var lastCenterPressTime = 0L
-    private var keyHoldStartTime = 0L
     private var lastActivityTime = System.currentTimeMillis()
 
-    private val pressedKeys = mutableSetOf<Int>()
     private val handler = Handler(Looper.getMainLooper())
-
-    private lateinit var cursorView: View
     private val webView: WebView = WebView(ctx)
 
     var isErrorScreenVisible = false
-    private val cursorHideTimeout = 3000L
 
     // Global layout listener for keyboard detection
     private var globalLayoutListener: ViewTreeObserver.OnGlobalLayoutListener? = null
 
     // Member variable for the focus and idle handler Runnable
     private lateinit var focusAndIdleHandlerRunnable: Runnable
+    
+    // Runnable for cursor hide after inactivity
+    private val cursorHideRunnable = Runnable { invalidate() }
+
+    // Check if cursor should be hidden due to timeout
+    private val isCursorDisappeared: Boolean
+        get() {
+            val now = System.currentTimeMillis()
+            return now - lastCursorUpdate > CURSOR_DISAPPEAR_TIMEOUT
+        }
 
     init {
+        initCursorParams()
         setupWebView()
-        setupCursor()
         setupJsInterfaces()
         setupKeyboardDetection()
         setupFocusAndIdleHandler()
+    }
+
+    private fun initCursorParams() {
+        paint.isAntiAlias = true
+        setWillNotDraw(false)
+        
+        val wm = ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val display = wm.defaultDisplay
+        val displaySize = android.graphics.Point()
+        display.getSize(displaySize)
+        
+        // TV Bro style sizing based on screen dimensions
+        cursorStrokeWidth = (displaySize.x / 400f)
+        cursorRadius = displaySize.x / 110
+        cursorRadiusPressed = cursorRadius + dpToPx(5f).toInt()
+        maxCursorSpeed = displaySize.x / 25f
+        scrollStartPadding = displaySize.x / 15
+    }
+    
+    private fun dpToPx(dp: Float): Float {
+        return dp * ctx.resources.displayMetrics.density
     }
 
     private fun setupWebView() {
@@ -78,25 +120,12 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         addView(webView)
     }
 
-    private fun setupCursor() {
-        cursorView = View(ctx).apply {
-            background = ContextCompat.getDrawable(ctx, R.drawable.tvbro_pointer)
-            alpha = 0.7f
-            val size = (ctx.resources.displayMetrics.widthPixels / 55).coerceAtLeast(30)
-            layoutParams = LayoutParams(size, size).apply {
-                leftMargin = -size / 2
-                topMargin = -size / 2
-            }
-            visibility = if (pointerModeEnabled) View.VISIBLE else View.GONE
-        }
-        addView(cursorView)
-
-        post {
-            cursorX = width / 2f
-            cursorY = height / 2f
-            cursorView.x = cursorX
-            cursorView.y = cursorY
-        }
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        if (isInEditMode) return
+        
+        cursorPosition.set(w / 2f, h / 2f)
+        postDelayed(cursorHideRunnable, CURSOR_DISAPPEAR_TIMEOUT)
     }
 
     private fun setupKeyboardDetection() {
@@ -127,7 +156,6 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         if (visible) {
             // Keyboard is open: Disable pointer, let WebView handle everything
             pointerModeEnabled = false
-            cursorView.visibility = View.GONE
             handler.removeCallbacks(cursorUpdateRunnable)
             // Ensure WebView has focus so typing works
             webView.requestFocus()
@@ -136,17 +164,15 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
             pointerModeEnabled = true
             
             // Fix Ghost Keyboard: Explicitly blur the active element in JS/DOM
-            // This prevents subsequent clicks from popping keyboard again if input is still focused
             webView.evaluateJavascript("if (document.activeElement) { document.activeElement.blur(); }", null)
             
             this.requestFocus() // Steal focus back for D-pad
-            cursorView.visibility = View.VISIBLE
             updateLastActivityTime()
         }
+        invalidate()
     }
 
     private fun setupJsInterfaces() {
-        // No longer strictly needed for state, but useful for debugging or quick reactions
         webView.addJavascriptInterface(object {
             @JavascriptInterface
             fun onTextFieldBlurred() {
@@ -156,10 +182,9 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
             @JavascriptInterface
             fun onTextFieldFocused() {
                 Log.d("FlixtorTV", "JS: TextField focused")
-                // We rely on GlobalLayoutListener for state, but we can help trigger the keyboard here
-                 handler.post {
-                     showKeyboard()
-                 }
+                handler.post {
+                    showKeyboard()
+                }
             }
         }, "Android")
         
@@ -197,22 +222,23 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
                 }
 
                 if (pointerModeEnabled && !this@CursorWebView.hasFocus() && !isErrorScreenVisible && !webView.hasFocus()) {
-                    // Only reclaim focus if we are supposed to be in pointer mode and keyboard is CLOSED
                     Log.d("FlixtorTV", "IdleHandler: Reclaiming focus for CWV")
                     val reclaimed = this@CursorWebView.requestFocus()
-                    if (reclaimed && cursorView.visibility != View.VISIBLE) {
-                        cursorView.visibility = View.VISIBLE
+                    if (reclaimed) {
+                        invalidate()
                     }
                 }
 
                 val idleTime = System.currentTimeMillis() - lastActivityTime
-                if (idleTime >= cursorHideTimeout &&
-                    cursorView.visibility == View.VISIBLE &&
+                if (idleTime >= CURSOR_HIDE_IDLE_TIMEOUT &&
                     pointerModeEnabled &&
                     !isKeyboardVisible &&
-                    this@CursorWebView.hasFocus()
+                    this@CursorWebView.hasFocus() &&
+                    !isCursorDisappeared
                 ) {
-                    cursorView.visibility = View.GONE
+                    // Force cursor disappear by updating lastCursorUpdate to old time
+                    lastCursorUpdate = System.currentTimeMillis() - CURSOR_DISAPPEAR_TIMEOUT - 1
+                    invalidate()
                     Log.d("FlixtorTV", "Cursor hidden due to inactivity")
                 }
                 handler.postDelayed(this, 500)
@@ -222,14 +248,53 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
 
         webView.setOnFocusChangeListener { _, webViewHasFocus ->
             Log.d("FlixtorTV", "WebView focus changed. Has Focus: $webViewHasFocus, Keyboard: $isKeyboardVisible")
-            if (webViewHasFocus && pointerModeEnabled && !isKeyboardVisible) {
-                 // If the WebView got focus but keyboard is NOT visible (and we want pointer mode),
-                 // it might be an accidental focus steal.
-                 // HOWEVER, when clicking an input, the WebView gets focus BEFORE the keyboard opens.
-                 // So we must be careful not to steal it back immediately.
-                 // We will verify this via simulateClick's return value or wait for LayoutListener.
+        }
+    }
+
+    override fun dispatchKeyEvent(event: AndroidKeyEvent): Boolean {
+        if (isInEditMode || !pointerModeEnabled) return super.dispatchKeyEvent(event)
+        
+        val keyCode = event.keyCode
+        val action = event.action
+        
+        when (keyCode) {
+            // Diagonal D-pad support
+            AndroidKeyEvent.KEYCODE_DPAD_UP_LEFT -> {
+                if (action == AndroidKeyEvent.ACTION_DOWN) {
+                    handleDirectionKeyEvent(event, -1, -1, true)
+                } else if (action == AndroidKeyEvent.ACTION_UP) {
+                    handleDirectionKeyEvent(event, 0, 0, false)
+                }
+                return true
+            }
+            AndroidKeyEvent.KEYCODE_DPAD_UP_RIGHT -> {
+                if (action == AndroidKeyEvent.ACTION_DOWN) {
+                    handleDirectionKeyEvent(event, 1, -1, true)
+                } else if (action == AndroidKeyEvent.ACTION_UP) {
+                    handleDirectionKeyEvent(event, 0, 0, false)
+                }
+                return true
+            }
+            AndroidKeyEvent.KEYCODE_DPAD_DOWN_LEFT -> {
+                if (action == AndroidKeyEvent.ACTION_DOWN) {
+                    handleDirectionKeyEvent(event, -1, 1, true)
+                } else if (action == AndroidKeyEvent.ACTION_UP) {
+                    handleDirectionKeyEvent(event, 0, 0, false)
+                }
+                return true
+            }
+            AndroidKeyEvent.KEYCODE_DPAD_DOWN_RIGHT -> {
+                if (action == AndroidKeyEvent.ACTION_DOWN) {
+                    handleDirectionKeyEvent(event, 1, 1, true)
+                } else if (action == AndroidKeyEvent.ACTION_UP) {
+                    handleDirectionKeyEvent(event, 0, 0, false)
+                }
+                return true
             }
         }
+        
+        // Fall through to onKeyDown/onKeyUp for other keys
+        return super.dispatchKeyEvent(event)
     }
 
     override fun onKeyDown(keyCode: Int, event: AndroidKeyEvent?): Boolean {
@@ -238,33 +303,25 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         // If keyboard is visible, pass everything to WebView (except maybe Back)
         if (isKeyboardVisible) {
              if (keyCode == AndroidKeyEvent.KEYCODE_BACK) {
-                 // Let default behavior close keyboard
                  return super.onKeyDown(keyCode, event)
              }
-             // For all other keys while typing, let the WebView/System handle it
              return super.onKeyDown(keyCode, event)
         }
 
         val now = System.currentTimeMillis()
-        if (now - lastKeyTime < 100 && !(keyCode == AndroidKeyEvent.KEYCODE_DPAD_CENTER && (now - lastCenterPressTime > 300))) {
-            return true
-        }
-        lastKeyTime = now
         lastActivityTime = now
 
-        // Show cursor moves
-        if (pointerModeEnabled && cursorView.visibility != View.VISIBLE &&
+        // Show cursor on D-pad activity
+        if (pointerModeEnabled && isCursorDisappeared &&
             (keyCode == AndroidKeyEvent.KEYCODE_DPAD_UP || keyCode == AndroidKeyEvent.KEYCODE_DPAD_DOWN ||
                     keyCode == AndroidKeyEvent.KEYCODE_DPAD_LEFT || keyCode == AndroidKeyEvent.KEYCODE_DPAD_RIGHT ||
                     keyCode == AndroidKeyEvent.KEYCODE_DPAD_CENTER)) {
             if (this.hasFocus()) {
-                cursorView.visibility = View.VISIBLE
+                lastCursorUpdate = System.currentTimeMillis()
+                invalidate()
             } else {
                 this.requestFocus()
             }
-        } else if (!pointerModeEnabled && keyCode != AndroidKeyEvent.KEYCODE_DPAD_CENTER && keyCode != AndroidKeyEvent.KEYCODE_BACK) {
-             // Not in pointer mode (and keyboard likely closed?), allow standard dpad nav
-             return super.onKeyDown(keyCode, event)
         }
 
         when (keyCode) {
@@ -275,7 +332,9 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
                 }
                 return super.onKeyDown(keyCode, event)
             }
-            AndroidKeyEvent.KEYCODE_DPAD_CENTER -> {
+            AndroidKeyEvent.KEYCODE_DPAD_CENTER,
+            AndroidKeyEvent.KEYCODE_ENTER,
+            AndroidKeyEvent.KEYCODE_NUMPAD_ENTER -> {
                 if (pointerModeEnabled) {
                     if (!this.hasFocus()) {
                         this.requestFocus()
@@ -286,42 +345,53 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
                     if (doublePress) {
                         Log.d("FlixtorTV", "Double press: Disabling pointer mode")
                         pointerModeEnabled = false
-                        cursorView.visibility = View.GONE
                         webView.requestFocus()
+                        invalidate()
                         return true
                     }
-                    Log.d("FlixtorTV", "Single press: Simulating click")
-                    simulateClick(cursorX.toInt(), cursorY.toInt())
-                    triggerRippleEffect()
+                    
+                    if (!isCursorDisappeared) {
+                        Log.d("FlixtorTV", "Single press: Simulating click")
+                        dpadCenterPressed = true
+                        dispatchMotionEvent(cursorPosition.x, cursorPosition.y, MotionEvent.ACTION_DOWN)
+                        invalidate()
+                    }
                     return true
                 } else {
                     Log.d("FlixtorTV", "Enabling pointer mode")
                     pointerModeEnabled = true
                     this.requestFocus()
-                    cursorView.visibility = View.VISIBLE
-                    cursorX = width / 2f
-                    cursorY = height / 2f
-                    cursorView.x = cursorX
-                    cursorView.y = cursorY
+                    cursorPosition.set(width / 2f, height / 2f)
+                    lastCursorUpdate = System.currentTimeMillis()
                     enableScrollableFocusNavigation()
+                    invalidate()
                     return true
                 }
             }
-            AndroidKeyEvent.KEYCODE_DPAD_UP,
-            AndroidKeyEvent.KEYCODE_DPAD_DOWN,
-            AndroidKeyEvent.KEYCODE_DPAD_LEFT,
+            AndroidKeyEvent.KEYCODE_DPAD_LEFT -> {
+                if (pointerModeEnabled) {
+                    handleDirectionKeyEvent(event, -1, UNCHANGED, true)
+                    return true
+                }
+                return handlePageScrolling(keyCode) || super.onKeyDown(keyCode, event)
+            }
             AndroidKeyEvent.KEYCODE_DPAD_RIGHT -> {
                 if (pointerModeEnabled) {
-                    if (!this.hasFocus()) {
-                        this.requestFocus()
-                        return true
-                    }
-                    if (pressedKeys.add(keyCode)) {
-                        if (pressedKeys.size == 1) {
-                            keyHoldStartTime = System.currentTimeMillis()
-                            handler.post(cursorUpdateRunnable)
-                        }
-                    }
+                    handleDirectionKeyEvent(event, 1, UNCHANGED, true)
+                    return true
+                }
+                return handlePageScrolling(keyCode) || super.onKeyDown(keyCode, event)
+            }
+            AndroidKeyEvent.KEYCODE_DPAD_UP -> {
+                if (pointerModeEnabled) {
+                    handleDirectionKeyEvent(event, UNCHANGED, -1, true)
+                    return true
+                }
+                return handlePageScrolling(keyCode) || super.onKeyDown(keyCode, event)
+            }
+            AndroidKeyEvent.KEYCODE_DPAD_DOWN -> {
+                if (pointerModeEnabled) {
+                    handleDirectionKeyEvent(event, UNCHANGED, 1, true)
                     return true
                 }
                 return handlePageScrolling(keyCode) || super.onKeyDown(keyCode, event)
@@ -330,64 +400,134 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         return super.onKeyDown(keyCode, event)
     }
 
-    private fun handlePageScrolling(keyCode: Int): Boolean {
-         // Logic for scrolling when NOT in pointer mode (standard D-pad nav)
-         // ... implementation same as before ...
-          when (keyCode) {
-                AndroidKeyEvent.KEYCODE_DPAD_UP -> {
-                    webView.scrollBy(0, -100)
-                    return true
-                }
-                AndroidKeyEvent.KEYCODE_DPAD_DOWN -> {
-                    webView.scrollBy(0, 100)
-                    return true
-                }
-                AndroidKeyEvent.KEYCODE_DPAD_LEFT -> {
-                    webView.scrollBy(-100, 0)
-                    return true
-                }
-                AndroidKeyEvent.KEYCODE_DPAD_RIGHT -> {
-                    webView.scrollBy(100, 0)
-                    return true
-                }
-            }
-        return false
-    }
-
     override fun onKeyUp(keyCode: Int, event: AndroidKeyEvent?): Boolean {
         if (isKeyboardVisible) {
             return super.onKeyUp(keyCode, event)
         }
-        if (pressedKeys.remove(keyCode) && pressedKeys.isEmpty()) {
-            handler.removeCallbacks(cursorUpdateRunnable)
+        
+        when (keyCode) {
+            AndroidKeyEvent.KEYCODE_DPAD_CENTER,
+            AndroidKeyEvent.KEYCODE_ENTER,
+            AndroidKeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                if (pointerModeEnabled && !isCursorDisappeared) {
+                    dispatchMotionEvent(cursorPosition.x, cursorPosition.y, MotionEvent.ACTION_UP)
+                    dpadCenterPressed = false
+                    invalidate()
+                    
+                    // Check if we hit an input field
+                    checkClickTarget(cursorPosition.x.toInt(), cursorPosition.y.toInt())
+                }
+                return true
+            }
+            AndroidKeyEvent.KEYCODE_DPAD_LEFT -> {
+                if (pointerModeEnabled) {
+                    handleDirectionKeyEvent(event, 0, UNCHANGED, false)
+                    return true
+                }
+            }
+            AndroidKeyEvent.KEYCODE_DPAD_RIGHT -> {
+                if (pointerModeEnabled) {
+                    handleDirectionKeyEvent(event, 0, UNCHANGED, false)
+                    return true
+                }
+            }
+            AndroidKeyEvent.KEYCODE_DPAD_UP -> {
+                if (pointerModeEnabled) {
+                    handleDirectionKeyEvent(event, UNCHANGED, 0, false)
+                    return true
+                }
+            }
+            AndroidKeyEvent.KEYCODE_DPAD_DOWN -> {
+                if (pointerModeEnabled) {
+                    handleDirectionKeyEvent(event, UNCHANGED, 0, false)
+                    return true
+                }
+            }
         }
         return super.onKeyUp(keyCode, event)
     }
 
-    private fun simulateClick(x: Int, y: Int) {
-        Log.d("FlixtorTV", "Simulating click at ($x, $y)")
-        val downTime = System.currentTimeMillis()
-        val eventDown = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x.toFloat(), y.toFloat(), 0)
-        val eventUp = MotionEvent.obtain(downTime, downTime + 100, MotionEvent.ACTION_UP, x.toFloat(), y.toFloat(), 0)
-
-        webView.isFocusableInTouchMode = true
-        // Note: We do NOT request focus from touch here aggressively,
-        // we let the dispatchTouchEvent enforce the click.
+    private fun handleDirectionKeyEvent(event: AndroidKeyEvent?, x: Int, y: Int, keyDown: Boolean) {
+        lastCursorUpdate = System.currentTimeMillis()
+        lastActivityTime = System.currentTimeMillis()
         
-        webView.dispatchTouchEvent(eventDown)
-        webView.dispatchTouchEvent(eventUp)
+        if (keyDown) {
+            if (event != null && keyDispatcherState.isTracking(event)) {
+                return
+            }
+            handler.removeCallbacks(cursorUpdateRunnable)
+            handler.post(cursorUpdateRunnable)
+            if (event != null) {
+                keyDispatcherState.startTracking(event, this)
+            }
+        } else {
+            if (event != null) {
+                keyDispatcherState.handleUpEvent(event)
+            }
+            cursorSpeed.set(0f, 0f)
+        }
         
-        eventDown.recycle()
-        eventUp.recycle()
+        cursorDirection.set(
+            if (x == UNCHANGED) cursorDirection.x else x,
+            if (y == UNCHANGED) cursorDirection.y else y
+        )
+    }
 
-        // Check if we hit an input
+    private fun handlePageScrolling(keyCode: Int): Boolean {
+        when (keyCode) {
+            AndroidKeyEvent.KEYCODE_DPAD_UP -> {
+                webView.scrollBy(0, -100)
+                return true
+            }
+            AndroidKeyEvent.KEYCODE_DPAD_DOWN -> {
+                webView.scrollBy(0, 100)
+                return true
+            }
+            AndroidKeyEvent.KEYCODE_DPAD_LEFT -> {
+                webView.scrollBy(-100, 0)
+                return true
+            }
+            AndroidKeyEvent.KEYCODE_DPAD_RIGHT -> {
+                webView.scrollBy(100, 0)
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun dispatchMotionEvent(x: Float, y: Float, action: Int) {
+        val downTime = android.os.SystemClock.uptimeMillis()
+        val eventTime = android.os.SystemClock.uptimeMillis()
+        
+        val properties = arrayOfNulls<MotionEvent.PointerProperties>(1)
+        val pp1 = MotionEvent.PointerProperties()
+        pp1.id = 0
+        pp1.toolType = MotionEvent.TOOL_TYPE_FINGER
+        properties[0] = pp1
+        
+        val pointerCoords = arrayOfNulls<MotionEvent.PointerCoords>(1)
+        val pc1 = MotionEvent.PointerCoords()
+        pc1.x = x
+        pc1.y = y
+        pc1.pressure = 1f
+        pc1.size = 1f
+        pointerCoords[0] = pc1
+        
+        val motionEvent = MotionEvent.obtain(
+            downTime, eventTime, action, 1, properties,
+            pointerCoords, 0, 0, 1f, 1f, 0, 0, 0, 0
+        )
+        webView.dispatchTouchEvent(motionEvent)
+        motionEvent.recycle()
+    }
+
+    private fun checkClickTarget(x: Int, y: Int) {
         webView.evaluateJavascript(
             """
             (function() {
                 const el = document.elementFromPoint($x, $y);
                 if (!el) return 'none';
                 
-                // Recursively check for specific tags (in case we clicked a span inside a button/input)
                 let temp = el;
                 while (temp && temp !== document.body) {
                     const tag = temp.tagName.toLowerCase();
@@ -396,8 +536,6 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
                         return 'text_field_clicked';
                     }
                     if (tag === 'select') {
-                        // For select, we also want to ensure it gets focus
-                        // but more importantly we tell native code NOT to steal it back
                         return 'select_clicked';
                     }
                     temp = temp.parentElement;
@@ -408,19 +546,16 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
             """.trimIndent()
         ) { result ->
             if (result != null) {
-                 if (result.contains("text_field_clicked")) {
+                if (result.contains("text_field_clicked")) {
                     Log.d("FlixtorTV", "Hit text field, forcing keyboard")
                     handler.postDelayed({ showKeyboard() }, 100)
                 } else if (result.contains("select_clicked")) {
-                     Log.d("FlixtorTV", "Hit SELECT tag, pausing auto-focus for dropdown")
-                     // Do nothing! Let WebView keep focus so the popup can show.
-                     // The idle handler will eventually wake up.
+                    Log.d("FlixtorTV", "Hit SELECT tag, pausing auto-focus for dropdown")
                 } else {
-                     // Standard click
-                     if (pointerModeEnabled) {
+                    if (pointerModeEnabled) {
                         val cwvFocus = this@CursorWebView.requestFocus()
-                        if (cwvFocus && cursorView.visibility != View.VISIBLE) {
-                            cursorView.visibility = View.VISIBLE
+                        if (cwvFocus) {
+                            invalidate()
                         }
                     }
                 }
@@ -429,72 +564,113 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         lastActivityTime = System.currentTimeMillis()
     }
 
-    private fun triggerRippleEffect() {
-        // ... same as before ...
-         val ripple = ScaleAnimation(1f, 1.5f, 1f, 1.5f,
-            Animation.RELATIVE_TO_SELF, 0.5f, Animation.RELATIVE_TO_SELF, 0.5f
-        ).apply {
-            duration = 200
-            repeatMode = Animation.REVERSE
-            repeatCount = 1
-        }
-        cursorView.startAnimation(ripple)
-    }
-
+    // Physics-based cursor update runnable (TV Bro style)
     private val cursorUpdateRunnable = object : Runnable {
         override fun run() {
             if (!pointerModeEnabled || isKeyboardVisible || !this@CursorWebView.hasFocus()) {
                 handler.removeCallbacks(this)
                 return
             }
-            val holdTime = System.currentTimeMillis() - keyHoldStartTime
-            val speedFactor = when {
-                holdTime < 200 -> 0.5f
-                holdTime < 500 -> 1.0f
-                holdTime < 1500 -> 1.5f
-                else -> 2.5f
-            }
-            val step = (baseCursorStep * speedFactor).coerceAtMost(60f)
-            var dx = 0f
-            var dy = 0f
-            if (AndroidKeyEvent.KEYCODE_DPAD_LEFT in pressedKeys) dx -= step
-            if (AndroidKeyEvent.KEYCODE_DPAD_RIGHT in pressedKeys) dx += step
-            if (AndroidKeyEvent.KEYCODE_DPAD_UP in pressedKeys) dy -= step
-            if (AndroidKeyEvent.KEYCODE_DPAD_DOWN in pressedKeys) dy += step
-
-            val halfCursorWidth = cursorView.width / 2f
-            val halfCursorHeight = cursorView.height / 2f
-             // Calculate new position
-            val newX = cursorX + dx
-            val newY = cursorY + dy
             
-            // Bounds
-            val minX = halfCursorWidth
-            val maxX = (width - halfCursorWidth).coerceAtLeast(halfCursorWidth)
-            val minY = halfCursorHeight
-            val maxY = (height - halfCursorHeight).coerceAtLeast(halfCursorHeight)
+            handler.removeCallbacks(cursorHideRunnable)
             
-            // Apply bounds to cursor
-            cursorX = newX.coerceIn(minX, maxX)
-            cursorY = newY.coerceIn(minY, maxY)
+            val newTime = System.currentTimeMillis()
+            val dTime = newTime - lastCursorUpdate
+            lastCursorUpdate = newTime
             
-            // Edge Scrolling
-            if (dx < 0 && newX <= minX) {
-                webView.scrollBy((-step).toInt(), 0)
-            } else if (dx > 0 && newX >= maxX) {
-                webView.scrollBy(step.toInt(), 0)
+            // Physics-based acceleration: accelerationFactor = 0.05f * deltaTime
+            val accelerationFactor = 0.05f * dTime
+            
+            // Accumulate speed based on direction with bounds
+            cursorSpeed.set(
+                bound(cursorSpeed.x + bound(cursorDirection.x.toFloat(), 1f) * accelerationFactor, maxCursorSpeed),
+                bound(cursorSpeed.y + bound(cursorDirection.y.toFloat(), 1f) * accelerationFactor, maxCursorSpeed)
+            )
+            
+            // Dead zone: stop micro-movements
+            if (kotlin.math.abs(cursorSpeed.x) < 0.1f) cursorSpeed.x = 0f
+            if (kotlin.math.abs(cursorSpeed.y) < 0.1f) cursorSpeed.y = 0f
+            
+            // If no direction and no speed, schedule hide and stop
+            if (cursorDirection.x == 0 && cursorDirection.y == 0 && cursorSpeed.x == 0f && cursorSpeed.y == 0f) {
+                postDelayed(cursorHideRunnable, CURSOR_DISAPPEAR_TIMEOUT)
+                return
             }
             
-            if (dy < 0 && newY <= minY) {
-                webView.scrollBy(0, (-step).toInt())
-            } else if (dy > 0 && newY >= maxY) {
-                webView.scrollBy(0, step.toInt())
+            val prevPosition = PointF(cursorPosition.x, cursorPosition.y)
+            
+            // Apply speed to position
+            cursorPosition.offset(cursorSpeed.x, cursorSpeed.y)
+            
+            // Bounds checking
+            if (cursorPosition.x < 0) cursorPosition.x = 0f
+            else if (cursorPosition.x > width - 1) cursorPosition.x = (width - 1).toFloat()
+            
+            if (cursorPosition.y < 0) cursorPosition.y = 0f
+            else if (cursorPosition.y > height - 1) cursorPosition.y = (height - 1).toFloat()
+            
+            // Dispatch move event if pressed and position changed
+            if (prevPosition.x != cursorPosition.x || prevPosition.y != cursorPosition.y) {
+                if (dpadCenterPressed) {
+                    dispatchMotionEvent(cursorPosition.x, cursorPosition.y, MotionEvent.ACTION_MOVE)
+                }
             }
-
-            cursorView.x = cursorX
-            cursorView.y = cursorY
+            
+            // Edge scroll zones: scroll when cursor enters padding zone from edge
+            var dx = 0
+            var dy = 0
+            
+            if (cursorPosition.y > height - scrollStartPadding) {
+                if (cursorSpeed.y > 0) dy = cursorSpeed.y.toInt()
+            } else if (cursorPosition.y < scrollStartPadding) {
+                if (cursorSpeed.y < 0) dy = cursorSpeed.y.toInt()
+            }
+            
+            if (cursorPosition.x > width - scrollStartPadding) {
+                if (cursorSpeed.x > 0) dx = cursorSpeed.x.toInt()
+            } else if (cursorPosition.x < scrollStartPadding) {
+                if (cursorSpeed.x < 0) dx = cursorSpeed.x.toInt()
+            }
+            
+            if (dx != 0 || dy != 0) {
+                webView.scrollBy(dx, dy)
+            }
+            
             lastActivityTime = System.currentTimeMillis()
-            handler.postDelayed(this, 16)
+            invalidate()
+            handler.post(this)
+        }
+    }
+
+    // Bound value to [-max, max]
+    private fun bound(value: Float, max: Float): Float {
+        return when {
+            value > max -> max
+            value < -max -> -max
+            else -> value
+        }
+    }
+
+    // Canvas-drawn cursor (TV Bro style)
+    override fun dispatchDraw(canvas: Canvas) {
+        super.dispatchDraw(canvas)
+        if (isInEditMode || !pointerModeEnabled) return
+        
+        if (!isCursorDisappeared) {
+            val cx = cursorPosition.x
+            val cy = cursorPosition.y
+            val radius = if (dpadCenterPressed) cursorRadiusPressed else cursorRadius
+            
+            // Draw filled circle with semi-transparent white
+            paint.color = Color.argb(128, 255, 255, 255)
+            paint.style = Paint.Style.FILL
+            canvas.drawCircle(cx, cy, radius.toFloat(), paint)
+            
+            // Draw stroke with gray
+            paint.color = Color.GRAY
+            paint.strokeWidth = cursorStrokeWidth
+            paint.style = Paint.Style.STROKE
+            canvas.drawCircle(cx, cy, radius.toFloat(), paint)
         }
     }
 
@@ -528,7 +704,6 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
 
     fun goBack() {
         if (isKeyboardVisible) {
-             // Shouldn't really happen if Back closes keyboard by default, but just in case
              val imm = ctx.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
              imm.hideSoftInputFromWindow(this.windowToken, 0)
         } else if (webView.canGoBack()) {
@@ -540,7 +715,10 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     fun getUrl(): String? = webView.url
     fun setWebViewClient(client: WebViewClient) { webView.webViewClient = client }
     fun setWebChromeClient(client: WebChromeClient) { webView.webChromeClient = client }
-    fun updateLastActivityTime() { lastActivityTime = System.currentTimeMillis() }
+    fun updateLastActivityTime() { 
+        lastActivityTime = System.currentTimeMillis()
+        lastCursorUpdate = System.currentTimeMillis()
+    }
     fun isPointerModeEnabled(): Boolean = pointerModeEnabled
 
     fun restoreCursorFocus() {
@@ -549,6 +727,7 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
                 requestFocus()
                 disableFocusNavigation()
                 updateLastActivityTime()
+                invalidate()
             }
         }
     }
