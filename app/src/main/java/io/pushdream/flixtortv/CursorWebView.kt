@@ -143,6 +143,7 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         """.trimIndent()
 
         private const val PLAYBACK_CHECK_MS = 20_000L
+        private const val HOVER_HEARTBEAT_MS = 800L
         private const val FALLBACK_CHROME_VERSION = "130.0.0.0"
     }
 
@@ -213,7 +214,18 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
 
     private val hideCursorRunnable = Runnable {
         cursorVisible = false
+        handler.removeCallbacks(hoverHeartbeatRunnable)
         invalidate()
+    }
+
+    // Over a fullscreen video, keep "moving the mouse" while the pointer shows, so the player's controls
+    // stay up as long as the pointer does instead of fading after a second.
+    private val hoverHeartbeatRunnable = object : Runnable {
+        override fun run() {
+            if (!cursorVisible || customView == null) return
+            dispatchHover()
+            handler.postDelayed(this, HOVER_HEARTBEAT_MS)
+        }
     }
 
     private val keyboardTimeoutRunnable = object : Runnable {
@@ -549,6 +561,8 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
                 dispatchMotionEvent(pressPosition.x, pressPosition.y, MotionEvent.ACTION_DOWN, dragDownTime)
             }
             dispatchMotionEvent(cursorPosition.x, cursorPosition.y, MotionEvent.ACTION_MOVE, dragDownTime)
+        } else {
+            dispatchHover()
         }
         invalidate()
     }
@@ -583,6 +597,13 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         if (!cursorVisible) {
             cursorVisible = true
             invalidate()
+            // Waking the pointer is moving the mouse: a video player shows its controls, without a click
+            // that would also pause it.
+            dispatchHover()
+        }
+        if (customView != null) {
+            handler.removeCallbacks(hoverHeartbeatRunnable)
+            handler.postDelayed(hoverHeartbeatRunnable, HOVER_HEARTBEAT_MS)
         }
         if (!anyDirectionHeld() && !centerDown) scheduleCursorHide()
     }
@@ -627,6 +648,29 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
             0, 0, 1f, 1f, 0, 0, 0, 0
         )
         target.dispatchTouchEvent(event)
+        event.recycle()
+    }
+
+    /**
+     * Tell the page where the pointer is, the way a mouse does: hover effects work, and video players show
+     * their controls when the pointer moves. Taps stay touch events; only hovering is a mouse.
+     */
+    private fun dispatchHover() {
+        if (typingMode || !pointerModeEnabled || width == 0) return
+        val now = SystemClock.uptimeMillis()
+        val properties = MotionEvent.PointerProperties().apply {
+            id = 0
+            toolType = MotionEvent.TOOL_TYPE_MOUSE
+        }
+        val coords = MotionEvent.PointerCoords().apply {
+            x = cursorPosition.x
+            y = cursorPosition.y
+        }
+        val event = MotionEvent.obtain(
+            now, now, MotionEvent.ACTION_HOVER_MOVE, 1, arrayOf(properties), arrayOf(coords),
+            0, 0, 1f, 1f, 0, 0, android.view.InputDevice.SOURCE_MOUSE, 0
+        )
+        (customView ?: webView).dispatchGenericMotionEvent(event)
         event.recycle()
     }
 
