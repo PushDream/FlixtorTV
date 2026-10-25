@@ -19,36 +19,34 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.annotation.RequiresApi
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.BorderStroke
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsFocusedAsState
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.draw.scale
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.font.Font
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import io.pushdream.flixtortv.ui.Brand
+import io.pushdream.flixtortv.ui.ErrorScreen
+import io.pushdream.flixtortv.ui.ExitDialog
+import io.pushdream.flixtortv.ui.LoadingBar
+import io.pushdream.flixtortv.ui.RemoteHint
+import io.pushdream.flixtortv.ui.SplashLoader
+import io.pushdream.flixtortv.ui.brandGlow
 import kotlinx.coroutines.delay
 
 private const val TAG = "FlixtorTV"
@@ -59,10 +57,13 @@ private const val SPLASH_MIN_MS = 1200L       // the logo always shows at least 
 private const val SPLASH_MAX_MS = 4000L       // and never longer than this, ready or not
 private const val PAGE_READY_PROGRESS = 90    // the page counts as ready to show from here
 
+private const val PREF_HINTS_SHOWN = "remote_hints_shown"
+private const val HINT_LAUNCHES = 3            // the remote hint shows on the first three launches
+private const val HINT_DELAY_MS = 800L
+private const val HINT_SHOW_MS = 7000L
+
 private const val MAX_AUTO_RETRIES = 3
 private const val RETRY_DELAY_S = 5
-
-private val Accent = Color(0xFF00BFFF)
 
 private fun isOnline(context: Context): Boolean {
     val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -94,11 +95,17 @@ private fun isSiteUrl(uri: Uri?): Boolean {
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val saved = getPreferences(Context.MODE_PRIVATE).getString(PREF_LAST_URL, null)
+        val prefs = getPreferences(Context.MODE_PRIVATE)
+        val saved = prefs.getString(PREF_LAST_URL, null)
         val initialUrl = saved?.takeIf { isSiteUrl(Uri.parse(it)) } ?: HOME_URL
 
+        // The remote hint is for newcomers: the first few launches only
+        val hintsShown = prefs.getInt(PREF_HINTS_SHOWN, 0)
+        val showRemoteHint = hintsShown < HINT_LAUNCHES
+        if (showRemoteHint) prefs.edit().putInt(PREF_HINTS_SHOWN, hintsShown + 1).apply()
+
         setContent {
-            FlixtorApp(initialUrl = initialUrl)
+            FlixtorApp(initialUrl = initialUrl, showRemoteHint = showRemoteHint)
         }
     }
 }
@@ -109,10 +116,11 @@ class MainActivity : ComponentActivity() {
  * fades out when the page is ready to show.
  */
 @Composable
-fun FlixtorApp(initialUrl: String) {
+fun FlixtorApp(initialUrl: String, showRemoteHint: Boolean) {
     var webStarted by remember { mutableStateOf(false) }
     var pageReady by remember { mutableStateOf(false) }
     var splashDone by remember { mutableStateOf(false) }
+    var hintVisible by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         withFrameNanos { }   // the splash's first frame
@@ -120,9 +128,28 @@ fun FlixtorApp(initialUrl: String) {
         webStarted = true
     }
 
-    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+    LaunchedEffect(splashDone) {
+        if (splashDone && showRemoteHint) {
+            delay(HINT_DELAY_MS)
+            hintVisible = true
+            delay(HINT_SHOW_MS)
+            hintVisible = false
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize().background(Brand.Background)) {
         if (webStarted) {
             FlixtorWebView(initialUrl = initialUrl, onPageReady = { pageReady = true })
+        }
+        AnimatedVisibility(
+            visible = hintVisible,
+            enter = fadeIn(tween(400)) + slideInVertically(tween(400)) { it / 2 },
+            exit = fadeOut(tween(500)),
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 40.dp)
+        ) {
+            RemoteHint()
         }
         if (!splashDone) {
             SplashScreen(webStarted = webStarted, pageReady = pageReady, onFinished = { splashDone = true })
@@ -174,21 +201,26 @@ fun SplashScreen(webStarted: Boolean, pageReady: Boolean, onFinished: () -> Unit
         modifier = Modifier
             .fillMaxSize()
             .alpha(splashOut.value)
-            .background(Color.Black),
+            .background(Brand.Background)
+            .brandGlow(),
         contentAlignment = Alignment.Center
     ) {
-        Image(
-            painter = painterResource(id = R.drawable.logo),
-            contentDescription = "FlixtorTV Logo",
-            modifier = Modifier
-                .size(200.dp)
-                .graphicsLayer {
-                    alpha = logoIn.value
-                    val scale = 0.85f + 0.15f * logoIn.value
-                    scaleX = scale
-                    scaleY = scale
-                }
-        )
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Image(
+                painter = painterResource(id = R.drawable.logo),
+                contentDescription = "FlixtorTV Logo",
+                modifier = Modifier
+                    .size(220.dp)
+                    .graphicsLayer {
+                        alpha = logoIn.value
+                        val scale = 0.85f + 0.15f * logoIn.value
+                        scaleX = scale
+                        scaleY = scale
+                    }
+            )
+            Spacer(Modifier.height(8.dp))
+            SplashLoader(modifier = Modifier.alpha(logoIn.value))
+        }
     }
 }
 
@@ -346,15 +378,7 @@ fun FlixtorWebView(initialUrl: String, onPageReady: () -> Unit) {
 
         // A thin bar at the top instead of a spinner over the page
         if (isLoading && errorMessage == null && progress < 100) {
-            LinearProgressIndicator(
-                progress = { progress / 100f },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(3.dp)
-                    .align(Alignment.TopCenter),
-                color = Accent,
-                trackColor = Color.Transparent
-            )
+            LoadingBar(progress = progress, modifier = Modifier.align(Alignment.TopCenter))
         }
 
         errorMessage?.let { message ->
@@ -370,100 +394,13 @@ fun FlixtorWebView(initialUrl: String, onPageReady: () -> Unit) {
         }
 
         if (showExitDialog) {
-            AlertDialog(
-                onDismissRequest = { showExitDialog = false },
-                confirmButton = {
-                    TextButton(onClick = { activity.finishAffinity() }) { Text("Yes") }
+            ExitDialog(
+                onStay = {
+                    showExitDialog = false
+                    // The dialog had focus: give it back to the page and its pointer
+                    cursorWebView.restoreCursorFocus()
                 },
-                dismissButton = {
-                    TextButton(onClick = { showExitDialog = false }) { Text("No") }
-                },
-                title = { Text("Exit App?") },
-                text = { Text("Do you want to exit Flixtor?") }
-            )
-        }
-    }
-}
-
-@Composable
-fun ErrorScreen(errorMessage: String, errorDetail: String, secondsToRetry: Int, onRetry: () -> Unit) {
-    val retryFocus = remember { FocusRequester() }
-    val retryInteraction = remember { MutableInteractionSource() }
-    val retryFocused by retryInteraction.collectIsFocusedAsState()
-    // The remote lands on Retry straight away
-    LaunchedEffect(Unit) { retryFocus.requestFocus() }
-
-    val montserratFontFamily = FontFamily(
-        Font(R.font.montserrat_regular, FontWeight.Normal),
-        Font(R.font.montserrat_bold, FontWeight.Bold)
-    )
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xFF0B0B0F))
-            .padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        Text(
-            text = "Oops! Something went wrong.",
-            fontFamily = montserratFontFamily,
-            fontWeight = FontWeight.Bold,
-            fontSize = 32.sp,
-            color = Color.White,
-            textAlign = TextAlign.Center,
-            modifier = Modifier.padding(bottom = 16.dp)
-        )
-        Text(
-            text = errorMessage,
-            fontFamily = montserratFontFamily,
-            fontWeight = FontWeight.Normal,
-            fontSize = 20.sp,
-            color = Color.LightGray,
-            textAlign = TextAlign.Center,
-            letterSpacing = 0.5.sp,
-            modifier = Modifier.padding(bottom = 4.dp)
-        )
-        if (errorDetail.isNotBlank()) {
-            Text(
-                text = errorDetail,
-                fontFamily = montserratFontFamily,
-                fontWeight = FontWeight.Normal,
-                fontSize = 13.sp,
-                color = Color.Gray,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.padding(bottom = 12.dp)
-            )
-        }
-        Text(
-            text = when {
-                secondsToRetry > 1 -> "Retrying in $secondsToRetry seconds..."
-                secondsToRetry == 1 -> "Retrying in 1 second..."
-                else -> "It will try again by itself when the connection returns, or press OK now."
-            },
-            fontFamily = montserratFontFamily,
-            fontWeight = FontWeight.Normal,
-            fontSize = 18.sp,
-            color = Color(0xFFBBDEFB),
-            textAlign = TextAlign.Center,
-            letterSpacing = 0.5.sp,
-            modifier = Modifier.padding(bottom = 24.dp)
-        )
-        Button(
-            onClick = onRetry,
-            modifier = Modifier
-                .focusRequester(retryFocus)
-                .scale(if (retryFocused) 1.1f else 1f),
-            interactionSource = retryInteraction,
-            border = if (retryFocused) BorderStroke(2.dp, Color.White) else null,
-            colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = Color.Black)
-        ) {
-            Text(
-                text = "Retry Now",
-                fontFamily = montserratFontFamily,
-                fontWeight = FontWeight.Bold,
-                fontSize = 16.sp
+                onExit = { activity.finishAffinity() }
             )
         }
     }

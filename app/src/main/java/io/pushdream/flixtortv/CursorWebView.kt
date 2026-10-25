@@ -144,6 +144,7 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
 
         private const val PLAYBACK_CHECK_MS = 20_000L
         private const val HOVER_HEARTBEAT_MS = 800L
+        private const val RIPPLE_MS = 380L
         private const val FALLBACK_CHROME_VERSION = "130.0.0.0"
     }
 
@@ -186,6 +187,8 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     private var cursorRadiusPressed = 0f
     private var cursorStrokeWidth = 0f
     private var scrollEdge = 0
+    private var rippleStartMs = 0L
+    private val ripplePosition = PointF(0f, 0f)
 
     // Fullscreen video support
     private var customView: View? = null
@@ -619,6 +622,9 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
 
     private fun tap(x: Float, y: Float) {
         val downTime = SystemClock.uptimeMillis()
+        ripplePosition.set(x, y)
+        rippleStartMs = downTime
+        invalidate()
         // Both halves of the tap go to the same view, even if fullscreen starts or ends in between
         val target = customView ?: webView
         if (!target.hasFocus()) target.requestFocus()
@@ -775,15 +781,18 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
 
     override fun dispatchDraw(canvas: Canvas) {
         super.dispatchDraw(canvas)
-        if (isInEditMode || !pointerModeEnabled || typingMode || !cursorVisible) return
+        if (isInEditMode || !pointerModeEnabled) return
+        drawClickRipple(canvas)
+        if (typingMode || !cursorVisible) return
 
         val cx = cursorPosition.x
         val cy = cursorPosition.y
         val radius = if (centerDown) cursorRadiusPressed else cursorRadius
 
-        // Soft fill, a dark ring and a light outer ring: visible on white and on black pages
+        // Soft fill (brand blue while pressed), a dark ring and a light outer ring: visible on white and on
+        // black pages
         paint.style = Paint.Style.FILL
-        paint.color = Color.argb(110, 255, 255, 255)
+        paint.color = if (centerDown) Color.argb(170, 30, 143, 255) else Color.argb(110, 255, 255, 255)
         canvas.drawCircle(cx, cy, radius, paint)
 
         paint.style = Paint.Style.STROKE
@@ -792,6 +801,22 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         canvas.drawCircle(cx, cy, radius, paint)
         paint.color = Color.argb(200, 255, 255, 255)
         canvas.drawCircle(cx, cy, radius + cursorStrokeWidth, paint)
+    }
+
+    /** A brand-blue ring that grows and fades from where a click landed, so every click is felt. */
+    private fun drawClickRipple(canvas: Canvas) {
+        if (rippleStartMs == 0L) return
+        val t = (SystemClock.uptimeMillis() - rippleStartMs) / RIPPLE_MS.toFloat()
+        if (t >= 1f) {
+            rippleStartMs = 0L
+            return
+        }
+        val eased = 1f - (1f - t) * (1f - t)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = cursorStrokeWidth * (2.5f - 1.5f * t)
+        paint.color = Color.argb((230 * (1f - t)).toInt(), 30, 143, 255)
+        canvas.drawCircle(ripplePosition.x, ripplePosition.y, cursorRadius * (1f + 1.8f * eased), paint)
+        postInvalidateOnAnimation()
     }
 
     // ---------------------------------------------------------------------------------------------
