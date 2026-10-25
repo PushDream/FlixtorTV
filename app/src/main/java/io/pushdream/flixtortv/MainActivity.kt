@@ -139,7 +139,7 @@ fun FlixtorApp(initialUrl: String, showRemoteHint: Boolean) {
 
     Box(modifier = Modifier.fillMaxSize().background(Brand.Background)) {
         if (webStarted) {
-            FlixtorWebView(initialUrl = initialUrl, onPageReady = { pageReady = true })
+            FlixtorWebView(initialUrl = initialUrl, pageCovered = !splashDone, onPageReady = { pageReady = true })
         }
         AnimatedVisibility(
             visible = hintVisible,
@@ -225,7 +225,7 @@ fun SplashScreen(webStarted: Boolean, pageReady: Boolean, onFinished: () -> Unit
 }
 
 @Composable
-fun FlixtorWebView(initialUrl: String, onPageReady: () -> Unit) {
+fun FlixtorWebView(initialUrl: String, pageCovered: Boolean, onPageReady: () -> Unit) {
     val activity = LocalContext.current as ComponentActivity
     val pageReady by rememberUpdatedState(onPageReady)
 
@@ -266,6 +266,8 @@ fun FlixtorWebView(initialUrl: String, onPageReady: () -> Unit) {
                         if (isSiteUrl(url?.let(Uri::parse))) {
                             activity.getPreferences(Context.MODE_PRIVATE).edit().putString(PREF_LAST_URL, url).apply()
                         }
+                        // A page after signing in carries the new login cookie: keep it safe right away
+                        saveCookies()
                     }
                     restoreCursorFocus()
                     Log.d(TAG, "Page finished: $url, Content height: ${view?.contentHeight}")
@@ -342,6 +344,11 @@ fun FlixtorWebView(initialUrl: String, onPageReady: () -> Unit) {
         val registered = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
                 runCatching { cm.registerDefaultNetworkCallback(callback) }.isSuccess
         onDispose { if (registered) runCatching { cm.unregisterNetworkCallback(callback) } }
+    }
+
+    // Hide the pointer while something covers the page: the splash, the error screen or the exit dialog
+    SideEffect {
+        cursorWebView.pointerSuppressed = pageCovered || errorMessage != null || showExitDialog
     }
 
     // Retry a failed page by itself a few times, counting down on the error screen

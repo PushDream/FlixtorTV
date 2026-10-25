@@ -144,6 +144,7 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
 
         private const val PLAYBACK_CHECK_MS = 20_000L
         private const val HOVER_HEARTBEAT_MS = 800L
+        private const val HOVER_MOVING_MS = 100L       // hovers while the pointer glides, at most this often
         private const val RIPPLE_MS = 380L
         private const val FALLBACK_CHROME_VERSION = "130.0.0.0"
     }
@@ -157,6 +158,15 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     private val webView: WebView = WebView(ctx)
 
     var isErrorScreenVisible = false
+
+    /** Something drawn over the page (the splash, a dialog, the error screen): hide the pointer meanwhile. */
+    var pointerSuppressed = false
+        set(value) {
+            if (field == value) return
+            field = value
+            invalidate()
+        }
+
 
     // Pointer state
     private val cursorPosition = PointF(0f, 0f)
@@ -188,6 +198,7 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     private var cursorStrokeWidth = 0f
     private var scrollEdge = 0
     private var rippleStartMs = 0L
+    private var lastHoverMs = 0L
     private val ripplePosition = PointF(0f, 0f)
 
     // Fullscreen video support
@@ -319,8 +330,8 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
                 }
             }
 
-            // Hardware acceleration for better performance
-            setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            // No setLayerType(LAYER_TYPE_HARDWARE): the window is hardware accelerated already, and a layer made
+            // every repaint render the whole page into an extra 1080p texture before reaching the screen.
 
             isFocusable = true
             isFocusableInTouchMode = true
@@ -470,6 +481,7 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     private fun directionReleased() {
         if (!anyDirectionHeld()) {
             stopFrameLoop()   // stop dead on release: no coasting past the target
+            if (!dragging) dispatchHover()   // the page learns exactly where the pointer came to rest
             scheduleCursorHide()
         }
     }
@@ -564,7 +576,9 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
                 dispatchMotionEvent(pressPosition.x, pressPosition.y, MotionEvent.ACTION_DOWN, dragDownTime)
             }
             dispatchMotionEvent(cursorPosition.x, cursorPosition.y, MotionEvent.ACTION_MOVE, dragDownTime)
-        } else {
+        } else if (SystemClock.uptimeMillis() - lastHoverMs >= HOVER_MOVING_MS) {
+            // A hover makes Chromium hit-test and repaint the page: on every frame of a glide that cost a
+            // Chromecast ~6 ms a frame. Menus and player controls react just as well to ~10 a second.
             dispatchHover()
         }
         invalidate()
@@ -664,6 +678,7 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     private fun dispatchHover() {
         if (typingMode || !pointerModeEnabled || width == 0) return
         val now = SystemClock.uptimeMillis()
+        lastHoverMs = now
         val properties = MotionEvent.PointerProperties().apply {
             id = 0
             toolType = MotionEvent.TOOL_TYPE_MOUSE
@@ -781,7 +796,11 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
 
     override fun dispatchDraw(canvas: Canvas) {
         super.dispatchDraw(canvas)
-        if (isInEditMode || !pointerModeEnabled) return
+        drawPointer(canvas)
+    }
+
+    private fun drawPointer(canvas: Canvas) {
+        if (isInEditMode || !pointerModeEnabled || pointerSuppressed) return
         drawClickRipple(canvas)
         if (typingMode || !cursorVisible) return
 
@@ -919,6 +938,15 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         webView.pauseTimers()
         mediaPlaying = false
         updateKeepScreenOn()
+        saveCookies()
+    }
+
+    /**
+     * Write cookies to storage now. Chromium otherwise saves them about every 30 seconds, so a sign-in followed by
+     * a power cut or Android closing the app within that time would be lost.
+     */
+    fun saveCookies() {
+        CookieManager.getInstance().flush()
     }
 
     fun onResume() {
