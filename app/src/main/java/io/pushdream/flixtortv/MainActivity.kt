@@ -1,133 +1,169 @@
 package io.pushdream.flixtortv
 
-import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
 import android.media.MediaPlayer
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
-import android.net.http.SslError
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
-import android.view.KeyEvent as AndroidKeyEvent
-import android.view.MotionEvent
-import android.view.View
-import android.view.ViewGroup
-import android.view.animation.Animation
-import android.view.animation.ScaleAnimation
-import android.view.inputmethod.InputMethodManager
-import android.webkit.SslErrorHandler
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
+import androidx.annotation.RequiresApi
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.input.key.Key
-import androidx.compose.ui.input.key.KeyEvent
-import androidx.compose.ui.input.key.KeyEventType
-import androidx.compose.ui.input.key.onKeyEvent
-import androidx.compose.ui.input.key.key
-import androidx.compose.ui.input.key.type
-import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.draw.scale
-import androidx.compose.ui.draw.rotate
-import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.text.font.Font
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.shape.CircleShape
-import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import io.pushdream.flixtortv.ui.Brand
+import io.pushdream.flixtortv.ui.ErrorScreen
+import io.pushdream.flixtortv.ui.ExitDialog
+import io.pushdream.flixtortv.ui.LoadingBar
+import io.pushdream.flixtortv.ui.RemoteHint
+import io.pushdream.flixtortv.ui.SplashLoader
+import io.pushdream.flixtortv.ui.brandGlow
 import kotlinx.coroutines.delay
 
+private const val TAG = "FlixtorTV"
+private const val HOME_URL = "https://flixtor.to/"
+private const val PREF_LAST_URL = "last_url"
+
+private const val SPLASH_MIN_MS = 1200L       // the logo always shows at least this long
+private const val SPLASH_MAX_MS = 4000L       // and never longer than this, ready or not
+private const val PAGE_READY_PROGRESS = 90    // the page counts as ready to show from here
+
+private const val PREF_HINTS_SHOWN = "remote_hints_shown"
+private const val HINT_LAUNCHES = 3            // the remote hint shows on the first three launches
+private const val HINT_DELAY_MS = 800L
+private const val HINT_SHOW_MS = 7000L
+
+private const val MAX_AUTO_RETRIES = 3
+private const val RETRY_DELAY_S = 5
+
+private fun isOnline(context: Context): Boolean {
+    val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+        @Suppress("DEPRECATION") return cm.activeNetworkInfo?.isConnected == true
+    }
+    val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
+    return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+}
+
+/** What went wrong, in words, for the error screen's headline. */
+private fun describeError(context: Context, errorCode: Int?): String = when {
+    !isOnline(context) -> "Your TV is not connected to the internet."
+    errorCode == WebViewClient.ERROR_HOST_LOOKUP -> "Couldn't find the site. Your internet or DNS may be down."
+    errorCode == WebViewClient.ERROR_TIMEOUT -> "The site took too long to respond."
+    errorCode == WebViewClient.ERROR_CONNECT -> "Couldn't connect to the site."
+    errorCode == WebViewClient.ERROR_FAILED_SSL_HANDSHAKE -> "A secure connection to the site failed."
+    else -> "The page couldn't be loaded."
+}
+
+/** Pages of the site itself. Everything else (pop-unders, ad redirects, app links) is kept out. */
+private fun isSiteUrl(uri: Uri?): Boolean {
+    val scheme = uri?.scheme?.lowercase()
+    if (scheme != "https" && scheme != "http") return false
+    val host = uri.host?.lowercase() ?: return false
+    return host == "flixtor.to" || host.endsWith(".flixtor.to")
+}
+
 class MainActivity : ComponentActivity() {
-    @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val sharedPrefs = getPreferences(Context.MODE_PRIVATE)
-        val initialUrl = sharedPrefs.getString("last_url", "https://flixtor.to/") ?: "https://flixtor.to/"
+        val prefs = getPreferences(Context.MODE_PRIVATE)
+        val saved = prefs.getString(PREF_LAST_URL, null)
+        val initialUrl = saved?.takeIf { isSiteUrl(Uri.parse(it)) } ?: HOME_URL
+
+        // The remote hint is for newcomers: the first few launches only
+        val hintsShown = prefs.getInt(PREF_HINTS_SHOWN, 0)
+        val showRemoteHint = hintsShown < HINT_LAUNCHES
+        if (showRemoteHint) prefs.edit().putInt(PREF_HINTS_SHOWN, hintsShown + 1).apply()
 
         setContent {
-            var showSplashScreen by remember { mutableStateOf(true) }
+            FlixtorApp(initialUrl = initialUrl, showRemoteHint = showRemoteHint)
+        }
+    }
+}
 
-            if (showSplashScreen) {
-                SplashScreen(
-                    onAnimationFinished = { showSplashScreen = false }
-                )
-            } else {
-                FlixtorWebView(initialUrl = initialUrl)
-            }
+/**
+ * The splash is drawn first; the WebView (about two seconds of Chromium start-up on a TV, on the main thread)
+ * is created right after, so the logo is on screen during that time and the page loads behind it. The splash
+ * fades out when the page is ready to show.
+ */
+@Composable
+fun FlixtorApp(initialUrl: String, showRemoteHint: Boolean) {
+    var webStarted by remember { mutableStateOf(false) }
+    var pageReady by remember { mutableStateOf(false) }
+    var splashDone by remember { mutableStateOf(false) }
+    var hintVisible by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        withFrameNanos { }   // the splash's first frame
+        withFrameNanos { }   // and the one that puts it on screen
+        webStarted = true
+    }
+
+    LaunchedEffect(splashDone) {
+        if (splashDone && showRemoteHint) {
+            delay(HINT_DELAY_MS)
+            hintVisible = true
+            delay(HINT_SHOW_MS)
+            hintVisible = false
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize().background(Brand.Background)) {
+        if (webStarted) {
+            FlixtorWebView(initialUrl = initialUrl, onPageReady = { pageReady = true })
+        }
+        AnimatedVisibility(
+            visible = hintVisible,
+            enter = fadeIn(tween(400)) + slideInVertically(tween(400)) { it / 2 },
+            exit = fadeOut(tween(500)),
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 40.dp)
+        ) {
+            RemoteHint()
+        }
+        if (!splashDone) {
+            SplashScreen(webStarted = webStarted, pageReady = pageReady, onFinished = { splashDone = true })
         }
     }
 }
 
 @Composable
-fun SplashScreen(onAnimationFinished: () -> Unit) {
+fun SplashScreen(webStarted: Boolean, pageReady: Boolean, onFinished: () -> Unit) {
     val context = LocalContext.current
-
-    val alpha by animateFloatAsState(
-        targetValue = 1f,
-        animationSpec = tween(durationMillis = 1000),
-        label = "fadeIn"
-    )
-
-    val scale by animateFloatAsState(
-        targetValue = 1f,
-        animationSpec = tween(durationMillis = 1000),
-        label = "scaleUp"
-    )
-
-    val pulse by animateFloatAsState(
-        targetValue = if (scale == 1f) 1.1f else 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 500, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "pulse"
-    )
-
-    val rotation by animateFloatAsState(
-        targetValue = 360f,
-        animationSpec = tween(durationMillis = 2000, easing = LinearEasing),
-        label = "rotation"
-    )
-
-    val shadowElevation by animateFloatAsState(
-        targetValue = if (scale == 1f) 16f else 4f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 500, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "shadowPulse"
-    )
+    val logoIn = remember { Animatable(0.6f) }    // the logo is visible from the first frame, then settles in
+    val splashOut = remember { Animatable(1f) }   // 1 to 0: the whole splash fades out
+    var minTimePassed by remember { mutableStateOf(false) }
+    var timedOut by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         try {
@@ -135,120 +171,192 @@ fun SplashScreen(onAnimationFinished: () -> Unit) {
             mediaPlayer?.start()
             mediaPlayer?.setOnCompletionListener { it.release() }
         } catch (e: Exception) {
-            Log.e("FlixtorTV", "Error playing launch sound: ${e.message}")
+            Log.e(TAG, "Error playing launch sound: ${e.message}")
         }
+    }
 
-        delay(2000)
-        onAnimationFinished()
+    // Timed from when the WebView exists: its start-up blocks the main thread, and would otherwise use up
+    // the splash's time before the page has even started loading.
+    LaunchedEffect(webStarted) {
+        if (!webStarted) return@LaunchedEffect
+        logoIn.animateTo(1f, tween(durationMillis = 500, easing = FastOutSlowInEasing))
+    }
+    LaunchedEffect(webStarted) {
+        if (!webStarted) return@LaunchedEffect
+        delay(SPLASH_MIN_MS)
+        minTimePassed = true
+        delay(SPLASH_MAX_MS - SPLASH_MIN_MS)
+        timedOut = true
+    }
+
+    val leave = minTimePassed && (pageReady || timedOut)
+    LaunchedEffect(leave) {
+        if (leave) {
+            splashOut.animateTo(0f, tween(durationMillis = 350))
+            onFinished()
+        }
     }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black),
+            .alpha(splashOut.value)
+            .background(Brand.Background)
+            .brandGlow(),
         contentAlignment = Alignment.Center
     ) {
-        Image(
-            painter = painterResource(id = R.drawable.logo),
-            contentDescription = "FlixtorTV Logo",
-            modifier = Modifier
-                .size(200.dp)
-                .alpha(alpha)
-                .scale(scale * pulse)
-                .rotate(rotation)
-                .shadow(
-                    elevation = shadowElevation.dp,
-                    shape = CircleShape,
-                    ambientColor = Color(0xFF00BFFF),
-                    spotColor = Color(0xFF00BFFF)
-                )
-        )
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Image(
+                painter = painterResource(id = R.drawable.logo),
+                contentDescription = "FlixtorTV Logo",
+                modifier = Modifier
+                    .size(220.dp)
+                    .graphicsLayer {
+                        alpha = logoIn.value
+                        val scale = 0.85f + 0.15f * logoIn.value
+                        scaleX = scale
+                        scaleY = scale
+                    }
+            )
+            Spacer(Modifier.height(8.dp))
+            SplashLoader(modifier = Modifier.alpha(logoIn.value))
+        }
     }
 }
 
-
 @Composable
-fun FlixtorWebView(initialUrl: String) {
+fun FlixtorWebView(initialUrl: String, onPageReady: () -> Unit) {
+    val activity = LocalContext.current as ComponentActivity
+    val pageReady by rememberUpdatedState(onPageReady)
+
+    var progress by remember { mutableIntStateOf(0) }
     var isLoading by remember { mutableStateOf(true) }
-    var hasError by remember { mutableStateOf(false) }
-    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }   // set while the page itself failed
+    var errorDetail by remember { mutableStateOf("") }               // Chromium's own code, for reference
+    var autoRetries by remember { mutableIntStateOf(0) }
+    var secondsToRetry by remember { mutableIntStateOf(0) }
     var showExitDialog by remember { mutableStateOf(false) }
-    var retryCount by remember { mutableStateOf(0) }
-    val maxRetries = 3
-    val context = LocalContext.current as MainActivity
-    val focusRequester = remember { FocusRequester() }
 
     val cursorWebView = remember {
-        CursorWebView(context).apply {
+        CursorWebView(activity).apply {
+            var mainFrameFailed = false
+
+            onProgressChanged = { newProgress ->
+                progress = newProgress
+                if (newProgress >= PAGE_READY_PROGRESS) pageReady()
+            }
+
             setWebViewClient(object : WebViewClient() {
                 override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                     super.onPageStarted(view, url, favicon)
+                    mainFrameFailed = false
                     isLoading = true
-                    hasError = false
-                    errorMessage = null
-                    retryCount = 0 // Reset retry count on new page load
-                    handler.post {
-                        if (isPointerModeEnabled()) {
-                            requestFocus()
-                            Log.d("FlixtorTV", "Restoring cursor visibility on page start")
-                            updateLastActivityTime()
-                        }
-                    }
-                    Log.d("FlixtorTV", "Page started: $url")
+                    updateLastActivityTime()
+                    Log.d(TAG, "Page started: $url")
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
                     isLoading = false
-                    hasError = false
-                    errorMessage = null
-                    context.getPreferences(Context.MODE_PRIVATE)
-                        .edit()
-                        .putString("last_url", url)
-                        .apply()
-                    restoreCursorFocus()
-                    val contentHeightLog = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                        ", Content height: ${view?.contentHeight}"
-                    } else {
-                        ""
+                    pageReady()
+                    // Chromium also "finishes" its own error page: keep the error screen up for that one
+                    if (!mainFrameFailed) {
+                        errorMessage = null
+                        autoRetries = 0
+                        if (isSiteUrl(url?.let(Uri::parse))) {
+                            activity.getPreferences(Context.MODE_PRIVATE).edit().putString(PREF_LAST_URL, url).apply()
+                        }
                     }
-                    Log.d("FlixtorTV", "Page finished: $url$contentHeightLog")
+                    restoreCursorFocus()
+                    Log.d(TAG, "Page finished: $url, Content height: ${view?.contentHeight}")
                 }
 
-                override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
-                    return if (url?.contains("flixtor.to") == true) {
-                        view?.loadUrl(url)
-                        false
-                    } else {
-                        true
-                    }
+                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                    // Frames (video players) navigate freely; the page itself stays on the site
+                    if (request == null || !request.isForMainFrame) return false
+                    val blocked = !isSiteUrl(request.url)
+                    if (blocked) Log.d(TAG, "Blocked navigation away to ${request.url.host}")
+                    return blocked
                 }
 
                 override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                    // A failed ad, image or tracker is not a broken page
+                    if (request?.isForMainFrame != true) return
+                    mainFrameFailed = true
                     isLoading = false
-                    hasError = true
-                    errorMessage = error?.description?.toString() ?: "Unknown error"
-                    Log.d("FlixtorTV", "Error: $errorMessage, URL: ${request?.url}")
+                    errorDetail = error?.description?.toString().orEmpty()
+                    errorMessage = describeError(activity, error?.errorCode)
+                    pageReady()
+                    Log.d(TAG, "Error: $errorDetail, URL: ${request.url}")
+                }
+
+                @RequiresApi(Build.VERSION_CODES.O)
+                override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                    // Usually the TV ran out of memory. The WebView cannot be used again: start over
+                    // with a fresh activity instead of crashing the app.
+                    Log.e(TAG, "Renderer gone (crashed: ${detail?.didCrash()}), recreating")
+                    activity.recreate()
+                    return true
                 }
             })
             loadUrl(initialUrl)
         }
     }
 
-    LaunchedEffect(hasError) {
-        cursorWebView.isErrorScreenVisible = hasError
-        if (hasError && retryCount < maxRetries) {
-            delay(5000)
-            if (hasError) {
-                retryCount++
-                Log.d("FlixtorTV", "Retry attempt $retryCount of $maxRetries")
-                isLoading = true
-                errorMessage = null
-                cursorWebView.loadUrl(cursorWebView.getUrl() ?: initialUrl)
+    fun retry() {
+        errorMessage = null
+        isLoading = true
+        cursorWebView.loadUrl(cursorWebView.getUrl() ?: initialUrl)
+    }
+
+    // Pause the page whenever the app is not on screen, so video, scripts and timers stop
+    DisposableEffect(activity) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> cursorWebView.onResume()
+                Lifecycle.Event.ON_PAUSE -> cursorWebView.onPause()
+                else -> {}
             }
-        } else if (hasError && retryCount >= maxRetries) {
-            Log.d("FlixtorTV", "Max retries reached, stopping automatic reload")
-            // Keep error screen up for manual retry
+        }
+        activity.lifecycle.addObserver(observer)
+        onDispose {
+            activity.lifecycle.removeObserver(observer)
+            cursorWebView.onDestroy()
+        }
+    }
+
+    // Back online while the error screen is up: try again right away
+    DisposableEffect(activity) {
+        val cm = activity.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                cursorWebView.post {
+                    if (errorMessage != null) {
+                        Log.d(TAG, "Network is back, retrying")
+                        autoRetries = 0
+                        retry()
+                    }
+                }
+            }
+        }
+        val registered = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
+                runCatching { cm.registerDefaultNetworkCallback(callback) }.isSuccess
+        onDispose { if (registered) runCatching { cm.unregisterNetworkCallback(callback) } }
+    }
+
+    // Retry a failed page by itself a few times, counting down on the error screen
+    LaunchedEffect(errorMessage, autoRetries) {
+        cursorWebView.isErrorScreenVisible = errorMessage != null
+        secondsToRetry = 0
+        if (errorMessage != null && autoRetries < MAX_AUTO_RETRIES) {
+            for (s in RETRY_DELAY_S downTo 1) {
+                secondsToRetry = s
+                delay(1000)
+            }
+            secondsToRetry = 0
+            autoRetries++
+            Log.d(TAG, "Retry attempt $autoRetries of $MAX_AUTO_RETRIES")
+            retry()
         }
     }
 
@@ -268,122 +376,31 @@ fun FlixtorWebView(initialUrl: String) {
             }
         }
 
-        if (isLoading && !hasError) {
-            CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
+        // A thin bar at the top instead of a spinner over the page
+        if (isLoading && errorMessage == null && progress < 100) {
+            LoadingBar(progress = progress, modifier = Modifier.align(Alignment.TopCenter))
         }
 
-        if (hasError) {
+        errorMessage?.let { message ->
             ErrorScreen(
-                errorMessage = errorMessage,
+                errorMessage = message,
+                errorDetail = errorDetail,
+                secondsToRetry = secondsToRetry,
                 onRetry = {
-                    hasError = false
-                    isLoading = true
-                    errorMessage = null
-                    retryCount = 0 // Reset for manual retry
-                    cursorWebView.loadUrl(cursorWebView.getUrl() ?: initialUrl)
-                },
-                modifier = Modifier
-                    .align(Alignment.Center)
-                    .focusRequester(focusRequester)
-                    .onKeyEvent { event ->
-                        if (event.type == KeyEventType.KeyDown &&
-                            (event.key == Key.DirectionCenter || event.key == Key.Enter)) {
-                            hasError = false
-                            isLoading = true
-                            errorMessage = null
-                            retryCount = 0
-                            cursorWebView.loadUrl(cursorWebView.getUrl() ?: initialUrl)
-                            true
-                        } else {
-                            false
-                        }
-                    }
+                    autoRetries = 0
+                    retry()
+                }
             )
         }
 
         if (showExitDialog) {
-            AlertDialog(
-                onDismissRequest = { showExitDialog = false },
-                confirmButton = {
-                    TextButton(onClick = { context.finishAffinity() }) { Text("Yes") }
+            ExitDialog(
+                onStay = {
+                    showExitDialog = false
+                    // The dialog had focus: give it back to the page and its pointer
+                    cursorWebView.restoreCursorFocus()
                 },
-                dismissButton = {
-                    TextButton(onClick = { showExitDialog = false }) { Text("No") }
-                },
-                title = { Text("Exit App?") },
-                text = { Text("Do you want to exit Flixtor?") }
-            )
-        }
-    }
-}
-
-@Composable
-fun ErrorScreen(errorMessage: String?, onRetry: () -> Unit, modifier: Modifier = Modifier) {
-    var countdown by remember { mutableStateOf(5) }
-
-    LaunchedEffect(Unit) {
-        while (countdown > 0) {
-            delay(1000)
-            countdown -= 1
-        }
-    }
-
-    val montserratFontFamily = FontFamily(
-        Font(R.font.montserrat_regular, FontWeight.Normal),
-        Font(R.font.montserrat_bold, FontWeight.Bold)
-    )
-
-    Column(
-        modifier = modifier
-            .padding(16.dp)
-            .fillMaxSize(),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        Text(
-            text = "Oops! Something went wrong.",
-            fontFamily = montserratFontFamily,
-            fontWeight = FontWeight.Bold,
-            fontSize = 32.sp,
-            color = Color.White,
-            textAlign = TextAlign.Center,
-            modifier = Modifier
-                .padding(bottom = 16.dp)
-                .shadow(4.dp, shape = RoundedCornerShape(8.dp))
-        )
-        Text(
-            text = errorMessage ?: "Check your internet connection or try again later.",
-            fontFamily = montserratFontFamily,
-            fontWeight = FontWeight.Normal,
-            fontSize = 20.sp,
-            color = Color.LightGray,
-            textAlign = TextAlign.Center,
-            letterSpacing = 0.5.sp,
-            modifier = Modifier
-                .padding(bottom = 8.dp)
-                .shadow(2.dp, shape = RoundedCornerShape(4.dp))
-        )
-        Text(
-            text = "Retrying in $countdown seconds...",
-            fontFamily = montserratFontFamily,
-            fontWeight = FontWeight.Normal,
-            fontSize = 18.sp,
-            color = Color(0xFFBBDEFB),
-            textAlign = TextAlign.Center,
-            letterSpacing = 0.5.sp,
-            modifier = Modifier
-                .padding(bottom = 8.dp)
-                .shadow(2.dp, shape = RoundedCornerShape(4.dp))
-        )
-        Button(
-            onClick = onRetry,
-            modifier = Modifier
-        ) {
-            Text(
-                text = "Retry Now",
-                fontFamily = montserratFontFamily,
-                fontWeight = FontWeight.Bold,
-                fontSize = 16.sp
+                onExit = { activity.finishAffinity() }
             )
         }
     }

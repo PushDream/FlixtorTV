@@ -106,7 +106,50 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
                 } catch (e) {}
             })()
         """.trimIndent()
+
+        // Scroll what is under the pointer: the innermost box that can still move that way (a dialog, a list,
+        // a carousel), else the page. Called with CSS pixel arguments (x, y, dx, dy).
+        private val SCROLL_AT_POINT_JS = """
+            (function(x, y, dx, dy) {
+                try {
+                    function can(e) {
+                        var s = getComputedStyle(e);
+                        var oy = s.overflowY, ox = s.overflowX;
+                        var sy = dy !== 0 && (oy === 'auto' || oy === 'scroll' || oy === 'overlay') &&
+                            (dy > 0 ? e.scrollTop + e.clientHeight < e.scrollHeight - 1 : e.scrollTop > 0);
+                        var sx = dx !== 0 && (ox === 'auto' || ox === 'scroll' || ox === 'overlay') &&
+                            (dx > 0 ? e.scrollLeft + e.clientWidth < e.scrollWidth - 1 : e.scrollLeft > 0);
+                        return sy || sx;
+                    }
+                    var el = document.elementFromPoint(x, y);
+                    while (el && el !== document.body && el !== document.documentElement) {
+                        if (can(el)) { el.scrollBy(dx, dy); return; }
+                        el = el.parentElement;
+                    }
+                    window.scrollBy(dx, dy);
+                } catch (e) { window.scrollBy(dx, dy); }
+            })
+        """.trimIndent()
+
+        // Is a video or audio element on the page playing? (Players inside other sites' frames are not visible.)
+        private val MEDIA_PLAYING_JS = """
+            (function() {
+                try {
+                    return Array.prototype.some.call(document.querySelectorAll('video, audio'), function(m) {
+                        return !m.paused && !m.ended && m.readyState > 2;
+                    });
+                } catch (e) { return false; }
+            })()
+        """.trimIndent()
+
+        private const val PLAYBACK_CHECK_MS = 20_000L
+        private const val HOVER_HEARTBEAT_MS = 800L
+        private const val RIPPLE_MS = 380L
+        private const val FALLBACK_CHROME_VERSION = "130.0.0.0"
     }
+
+    /** Page load progress, 0 to 100, for a progress bar. */
+    var onProgressChanged: ((Int) -> Unit)? = null
 
     private val handler = Handler(Looper.getMainLooper())
     private val choreographer = Choreographer.getInstance()
@@ -144,6 +187,8 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     private var cursorRadiusPressed = 0f
     private var cursorStrokeWidth = 0f
     private var scrollEdge = 0
+    private var rippleStartMs = 0L
+    private val ripplePosition = PointF(0f, 0f)
 
     // Fullscreen video support
     private var customView: View? = null
@@ -153,9 +198,37 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
     // Keyboard detection
     private var globalLayoutListener: ViewTreeObserver.OnGlobalLayoutListener? = null
 
+    // Edge scrolling, in view pixels not yet sent to the page; one script call in flight at a time
+    private var pendingScrollX = 0f
+    private var pendingScrollY = 0f
+    private var scrollInFlight = false
+
+    // Keep the TV awake while something plays, so the screensaver does not cut in
+    private var mediaPlaying = false
+    private val playbackCheckRunnable = object : Runnable {
+        override fun run() {
+            webView.evaluateJavascript(MEDIA_PLAYING_JS) { result ->
+                mediaPlaying = result == "true"
+                updateKeepScreenOn()
+            }
+            handler.postDelayed(this, PLAYBACK_CHECK_MS)
+        }
+    }
+
     private val hideCursorRunnable = Runnable {
         cursorVisible = false
+        handler.removeCallbacks(hoverHeartbeatRunnable)
         invalidate()
+    }
+
+    // Over a fullscreen video, keep "moving the mouse" while the pointer shows, so the player's controls
+    // stay up as long as the pointer does instead of fading after a second.
+    private val hoverHeartbeatRunnable = object : Runnable {
+        override fun run() {
+            if (!cursorVisible || customView == null) return
+            dispatchHover()
+            handler.postDelayed(this, HOVER_HEARTBEAT_MS)
+        }
     }
 
     private val keyboardTimeoutRunnable = object : Runnable {
@@ -217,7 +290,12 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
             settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
-                userAgentString = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36"
+                // Desktop Chrome, with the version this WebView really is: the browser's own version headers
+                // report the real one, and a mismatch looks like a bot to anti-bot checks.
+                val chromeVersion = Regex("Chrome/([\\d.]+)").find(WebSettings.getDefaultUserAgent(ctx))
+                    ?.groupValues?.get(1) ?: FALLBACK_CHROME_VERSION
+                userAgentString = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) " +
+                        "Chrome/$chromeVersion Safari/537.36"
                 setSupportZoom(false)
                 builtInZoomControls = false
                 loadWithOverviewMode = true
@@ -246,6 +324,8 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
 
             isFocusable = true
             isFocusableInTouchMode = true
+            // The WebView always holds focus here; without this Android TV frames the whole screen in orange
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) defaultFocusHighlightEnabled = false
         }
 
         // Set up WebChromeClient for fullscreen video support
@@ -266,10 +346,12 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
 
                 view?.let {
                     it.setBackgroundColor(Color.BLACK)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) it.defaultFocusHighlightEnabled = false
                     addView(it, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
                     webView.visibility = View.GONE
                     it.requestFocus()
                 }
+                updateKeepScreenOn()
                 showCursor()
 
                 Log.d(TAG, "Entered fullscreen video mode")
@@ -284,6 +366,10 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
                     leaveFullscreen(notifyPage = false)
                     Log.d(TAG, "Exited fullscreen video mode")
                 }
+            }
+
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                onProgressChanged?.invoke(newProgress)
             }
         }
 
@@ -463,17 +549,13 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         val oldY = cursorPosition.y
         cursorPosition.set((oldX + dx).coerceIn(0f, width - 1f), (oldY + dy).coerceIn(0f, height - 1f))
 
-        // Near an edge and still heading for it: scroll the page instead of stopping (not over a
-        // fullscreen video, which has nothing to scroll).
-        var scrollX = 0
-        var scrollY = 0
-        if (dy > 0 && cursorPosition.y > height - scrollEdge || dy < 0 && cursorPosition.y < scrollEdge) {
-            scrollY = dy.toInt().let { if (it == 0) dy.compareTo(0f) else it }
+        // Near an edge and still heading for it: scroll what is under the pointer instead of stopping (not over
+        // a fullscreen video, which has nothing to scroll).
+        if (customView == null) {
+            if (dy > 0 && cursorPosition.y > height - scrollEdge || dy < 0 && cursorPosition.y < scrollEdge) pendingScrollY += dy
+            if (dx > 0 && cursorPosition.x > width - scrollEdge || dx < 0 && cursorPosition.x < scrollEdge) pendingScrollX += dx
+            flushScroll()
         }
-        if (dx > 0 && cursorPosition.x > width - scrollEdge || dx < 0 && cursorPosition.x < scrollEdge) {
-            scrollX = dx.toInt().let { if (it == 0) dx.compareTo(0f) else it }
-        }
-        if ((scrollX != 0 || scrollY != 0) && customView == null) webView.scrollBy(scrollX, scrollY)
 
         if (centerDown) {
             if (!dragging) {
@@ -482,8 +564,35 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
                 dispatchMotionEvent(pressPosition.x, pressPosition.y, MotionEvent.ACTION_DOWN, dragDownTime)
             }
             dispatchMotionEvent(cursorPosition.x, cursorPosition.y, MotionEvent.ACTION_MOVE, dragDownTime)
+        } else {
+            dispatchHover()
         }
         invalidate()
+    }
+
+    /**
+     * Send the accumulated edge scroll to the page, converted to CSS pixels. One call at a time: what builds up
+     * while a call runs goes out with the next one, so a slow page gets fewer, larger steps instead of a backlog.
+     */
+    private fun flushScroll() {
+        if (scrollInFlight) return
+        @Suppress("DEPRECATION") val scale = webView.scale.takeIf { it > 0f } ?: resources.displayMetrics.density
+        val dx = (pendingScrollX / scale).toInt()
+        val dy = (pendingScrollY / scale).toInt()
+        if (dx == 0 && dy == 0) return
+        pendingScrollX -= dx * scale
+        pendingScrollY -= dy * scale
+        val x = (cursorPosition.x / scale).toInt()
+        val y = (cursorPosition.y / scale).toInt()
+        scrollInFlight = true
+        webView.evaluateJavascript("$SCROLL_AT_POINT_JS($x, $y, $dx, $dy)") {
+            scrollInFlight = false
+            if (anyDirectionHeld()) flushScroll() else { pendingScrollX = 0f; pendingScrollY = 0f }
+        }
+    }
+
+    private fun updateKeepScreenOn() {
+        keepScreenOn = customView != null || mediaPlaying
     }
 
     private fun showCursor() {
@@ -491,6 +600,13 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         if (!cursorVisible) {
             cursorVisible = true
             invalidate()
+            // Waking the pointer is moving the mouse: a video player shows its controls, without a click
+            // that would also pause it.
+            dispatchHover()
+        }
+        if (customView != null) {
+            handler.removeCallbacks(hoverHeartbeatRunnable)
+            handler.postDelayed(hoverHeartbeatRunnable, HOVER_HEARTBEAT_MS)
         }
         if (!anyDirectionHeld() && !centerDown) scheduleCursorHide()
     }
@@ -506,6 +622,9 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
 
     private fun tap(x: Float, y: Float) {
         val downTime = SystemClock.uptimeMillis()
+        ripplePosition.set(x, y)
+        rippleStartMs = downTime
+        invalidate()
         // Both halves of the tap go to the same view, even if fullscreen starts or ends in between
         val target = customView ?: webView
         if (!target.hasFocus()) target.requestFocus()
@@ -535,6 +654,29 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
             0, 0, 1f, 1f, 0, 0, 0, 0
         )
         target.dispatchTouchEvent(event)
+        event.recycle()
+    }
+
+    /**
+     * Tell the page where the pointer is, the way a mouse does: hover effects work, and video players show
+     * their controls when the pointer moves. Taps stay touch events; only hovering is a mouse.
+     */
+    private fun dispatchHover() {
+        if (typingMode || !pointerModeEnabled || width == 0) return
+        val now = SystemClock.uptimeMillis()
+        val properties = MotionEvent.PointerProperties().apply {
+            id = 0
+            toolType = MotionEvent.TOOL_TYPE_MOUSE
+        }
+        val coords = MotionEvent.PointerCoords().apply {
+            x = cursorPosition.x
+            y = cursorPosition.y
+        }
+        val event = MotionEvent.obtain(
+            now, now, MotionEvent.ACTION_HOVER_MOVE, 1, arrayOf(properties), arrayOf(coords),
+            0, 0, 1f, 1f, 0, 0, android.view.InputDevice.SOURCE_MOUSE, 0
+        )
+        (customView ?: webView).dispatchGenericMotionEvent(event)
         event.recycle()
     }
 
@@ -639,15 +781,18 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
 
     override fun dispatchDraw(canvas: Canvas) {
         super.dispatchDraw(canvas)
-        if (isInEditMode || !pointerModeEnabled || typingMode || !cursorVisible) return
+        if (isInEditMode || !pointerModeEnabled) return
+        drawClickRipple(canvas)
+        if (typingMode || !cursorVisible) return
 
         val cx = cursorPosition.x
         val cy = cursorPosition.y
         val radius = if (centerDown) cursorRadiusPressed else cursorRadius
 
-        // Soft fill, a dark ring and a light outer ring: visible on white and on black pages
+        // Soft fill (brand blue while pressed), a dark ring and a light outer ring: visible on white and on
+        // black pages
         paint.style = Paint.Style.FILL
-        paint.color = Color.argb(110, 255, 255, 255)
+        paint.color = if (centerDown) Color.argb(170, 30, 143, 255) else Color.argb(110, 255, 255, 255)
         canvas.drawCircle(cx, cy, radius, paint)
 
         paint.style = Paint.Style.STROKE
@@ -656,6 +801,22 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         canvas.drawCircle(cx, cy, radius, paint)
         paint.color = Color.argb(200, 255, 255, 255)
         canvas.drawCircle(cx, cy, radius + cursorStrokeWidth, paint)
+    }
+
+    /** A brand-blue ring that grows and fades from where a click landed, so every click is felt. */
+    private fun drawClickRipple(canvas: Canvas) {
+        if (rippleStartMs == 0L) return
+        val t = (SystemClock.uptimeMillis() - rippleStartMs) / RIPPLE_MS.toFloat()
+        if (t >= 1f) {
+            rippleStartMs = 0L
+            return
+        }
+        val eased = 1f - (1f - t) * (1f - t)
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = cursorStrokeWidth * (2.5f - 1.5f * t)
+        paint.color = Color.argb((230 * (1f - t)).toInt(), 30, 143, 255)
+        canvas.drawCircle(ripplePosition.x, ripplePosition.y, cursorRadius * (1f + 1.8f * eased), paint)
+        postInvalidateOnAnimation()
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -675,6 +836,14 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
                             el.setAttribute('tabindex', '-1');
                         }
                     });
+                    // Chromium gives a freshly focused WebView keyboard-style focus on the first link, which
+                    // shows "Skip to main content" links and focus rings. Nobody tabbed here: drop it.
+                    const a = document.activeElement;
+                    const tag = a ? a.tagName.toLowerCase() : '';
+                    if (a && a !== document.body && tag !== 'input' && tag !== 'textarea' && tag !== 'select' &&
+                            !a.isContentEditable && a.matches(':focus-visible')) {
+                        a.blur();
+                    }
                 } catch (e) {
                 }
             })()
@@ -693,6 +862,7 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         removeView(view)
         webView.visibility = View.VISIBLE
         systemUiVisibility = originalSystemUiVisibility
+        updateKeepScreenOn()
         webView.requestFocus()
         showCursor()
         if (notifyPage) callback?.onCustomViewHidden()
@@ -741,14 +911,21 @@ constructor(private val ctx: Context) : FrameLayout(ctx) {
         }
     }
 
+    /** The app left the screen: stop playback, scripts and timers so nothing runs in the background. */
     fun onPause() {
-        webView.onPause()
         releaseAllKeys()
         handler.removeCallbacksAndMessages(null)
+        webView.onPause()
+        webView.pauseTimers()
+        mediaPlaying = false
+        updateKeepScreenOn()
     }
 
     fun onResume() {
+        webView.resumeTimers()
         webView.onResume()
+        handler.removeCallbacks(playbackCheckRunnable)
+        handler.postDelayed(playbackCheckRunnable, PLAYBACK_CHECK_MS)
         if (!typingMode) showCursor()
     }
 

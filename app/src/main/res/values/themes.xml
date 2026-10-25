@@ -1,4 +1,7 @@
 <resources>
 
-    <style name="Theme.FlixtorTV" parent="Theme.AppCompat.DayNight.NoActionBar" />
+    <style name="Theme.FlixtorTV" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <!-- Black from the first frame: no white flash before the splash is drawn -->
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
 </resources>
