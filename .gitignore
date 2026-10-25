@@ -14,3 +14,6 @@ local.properties
 # JVM crash logs
 hs_err_pid*.log
 replay_pid*.log
+
+# Kotlin 2.x compiler session data
+.kotlin/
